@@ -1,9 +1,9 @@
 extern crate aes;
 extern crate base32;
 extern crate clap;
-extern crate hex;
-extern crate hmac;
-extern crate libc;
+extern crate hex; //TODO: Clap an argument to require otp challenge with the client peer and print otp from server side. (not provided as input)
+extern crate hmac; //TODO: Add a clap switch to be provided a otp key auth from server peer to client peer.
+extern crate libc; //TODO: Build route on both peers automatically.
 extern crate lopdf;
 extern crate pnet;
 extern crate printpdf;
@@ -21,7 +21,7 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
 use printpdf::*;
-use rand::seq::SliceRandom;
+use rand::Rng;
 use sha2::Sha512;
 
 use std::borrow::{Borrow, BorrowMut};
@@ -45,7 +45,10 @@ const EMPTY_LINE_WIDTH: f64 = 210.0;
 const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
 
 static INIT: Once = Once::new();
+static INIT2: Once = Once::new();
 static mut SECRET: Option<String> = None;
+static mut OTP: u64 = 0;
+static mut IN_SYNC: bool = false;
 
 #[cfg(target_family = "unix")]
 fn is_elevated() -> bool {
@@ -57,6 +60,14 @@ fn init_secret(secret: String) {
     unsafe {
         INIT.call_once(|| {
             SECRET = Some(secret);
+        });
+    }
+}
+
+fn init_otp(otp: u64) {
+    unsafe {
+        INIT2.call_once(|| {
+            OTP = otp;
         });
     }
 }
@@ -73,17 +84,18 @@ fn get_secret() -> String {
     }
 }
 
+fn get_otp() -> u64 {
+    unsafe {
+        let otp_clone = OTP.clone();
+        let otp = otp_clone;
+        otp
+    }
+}
+
 fn generate_fips() -> String {
-    const BASE64_ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    // Create a random number generator
-    let length: usize = 44;
     let mut rng = rand::thread_rng();
-    // Generate a random string of the specified length
-    (0..length)
-        .map(|_| BASE64_ALPHABET.choose(&mut rng).unwrap()) // Choose a random character from the alphabet
-        .map(|&byte| byte as char) // Convert the byte to char
-        .collect() // Collect into a String
+    let secret: Vec<u8> = (0..16).map(|_| rng.gen::<u8>()).collect();
+    base32::encode(Alphabet::RFC4648 { padding: false }, &secret)
 }
 
 fn format_key(totp: u64) -> Array<u8, typenum::U32> {
@@ -219,6 +231,7 @@ fn generate_totp(secret: String) -> u64 {
         result[offset + 6],
         result[offset + 7],
     ]) & 0x1FFFFFFFFFFFFFFF;
+
     code % 1_0000_0000
 }
 
@@ -522,15 +535,19 @@ fn processpdf(doc: PdfDocumentReference, base64: &mut String) -> Vec<u8> {
                                 {
                                     let encrypted_content = stream.content.to_vec();
 
-                                    let decrypted =
-                                        decrypt(encrypted_content, generate_totp(get_secret()));
-
-                                    //let mut stream = stream.clone();
-                                    //stream.content.clone_from(&decrypted);
-
-                                    //let content = stream
-                                    //    .decode_content()
-                                    //    .expect("Failed to decode stream content");
+                                    let decrypted;
+                                    unsafe {
+                                        if !IN_SYNC && OTP == 0 || IN_SYNC == true {
+                                            decrypted = decrypt(
+                                                encrypted_content,
+                                                generate_totp(get_secret()),
+                                            );
+                                        } else {
+                                            IN_SYNC = true;
+                                            generate_totp(get_secret());
+                                            decrypted = decrypt(encrypted_content, get_otp());
+                                        }
+                                    }
                                     match decode_utf8_safe(&decrypted) {
                                         Ok(lotextstring) => {
                                             match extract_text_from_pdf_stream(lotextstring) {
@@ -697,10 +714,21 @@ fn networked(secret: String, ip: &str) {
         match Device::new(&config) {
             Ok(dev) => {
                 let dev = Arc::new(Mutex::new(dev));
-                println!(
-                    "TUN device created: {} --> local[{}] <--> peer[{}]",
-                    &tun_name, &subnet, &ip
-                );
+                if get_otp() == 0 {
+                    println!(
+                        //Client Peer Mode.
+                        "TUN device created: {} --> local[{}] <--> peer[{}]",
+                        &tun_name, &subnet, &ip
+                    );
+                } else {
+                    println!(
+                        "TUN device created: {} --> local[{}] <--> peer[{}]\nDon't forget to use --otp {} on the client within 30 sec.",
+                        &tun_name,
+                        &subnet,
+                        &ip,
+                        get_otp()
+                    );
+                }
 
                 // Main loop for packet processing
                 panic::catch_unwind(|| {
@@ -768,12 +796,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .short('i')
                     .long("ip")
                     .value_name("IP"),
+            )
+            .arg(
+                Arg::new("otp")
+                    .help("The OTP from the SERVER (Client Peer Mode)")
+                    .required(false)
+                    .action(ArgAction::Set)
+                    .short('o')
+                    .long("otp")
+                    .value_name("OTP"),
             );
         let mut cloned_switches = switches.clone();
 
         let arguments = switches.get_matches();
 
         update_secret(generate_fips());
+        if let Some(mut otp) = arguments.try_get_raw("otp").ok().flatten() {
+            println!("Running in CLIENT peer mode...");
+            let otp = otp.next().unwrap().to_str().unwrap();
+            init_otp(otp.parse::<u64>().expect("ERROR parsing OTP!"))
+        } else {
+            eprintln!("Running in SERVER peer mode...");
+            init_otp(generate_totp(get_secret()));
+        }
+
         match arguments.try_get_raw("ip") {
             Ok(ip_option) => {
                 let ip = ip_option.unwrap().next().unwrap().to_str().unwrap();

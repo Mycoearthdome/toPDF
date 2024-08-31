@@ -597,27 +597,39 @@ fn get_available_subnet() -> Option<String> {
 
     // Iterate through the non-routable zones and find the first available subnet
     for (_zone, address, netmask) in non_routable_zones.iter() {
-        let mut available = true;
+        // Parse the zone's IP address
+        let zone_ip = address
+            .split('.')
+            .map(|x| x.parse::<u8>().unwrap())
+            .collect::<Vec<u8>>();
 
-        for line in lines.iter() {
-            if line.contains("inet") && !line.contains("inet6") {
-                //IPV4 only
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                let ip_addr = parts[1].split('/').next().unwrap();
-                let ip_addr = ip_addr.parse::<Ipv4Addr>().unwrap();
+        // Check every possible IP in the subnet
+        for i in 1..=255 {
+            let ip = [zone_ip[0], zone_ip[1], zone_ip[2], i];
 
-                // Check if the subnet is already in use
-                if ip_addr.octets()[0] == address.split('.').next().unwrap().parse::<u8>().unwrap()
-                {
-                    available = false;
-                    break;
+            // Check if the IP is already in use
+            let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+            let mut ip_in_use = false;
+            for line in lines.iter() {
+                if line.contains("inet") && !line.contains("inet6") {
+                    //IPV4 only
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    let existing_ip_addr = parts[1].split('/').next().unwrap();
+                    let existing_ip_addr = existing_ip_addr.parse::<Ipv4Addr>().unwrap();
+                    if existing_ip_addr == ip_addr {
+                        ip_in_use = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        if available {
-            // Return the available subnet as a &str
-            return Some(format!("{} {}", address, netmask));
+            // If the IP is not in use, return it
+            if !ip_in_use {
+                return Some(format!(
+                    "{}.{}.{}.{} {}",
+                    ip[0], ip[1], ip[2], ip[3], netmask
+                ));
+            }
         }
     }
 
@@ -685,7 +697,10 @@ fn networked(secret: String, ip: &str) {
         match Device::new(&config) {
             Ok(dev) => {
                 let dev = Arc::new(Mutex::new(dev));
-                println!("TUN device created: {}", &tun_name);
+                println!(
+                    "TUN device created: {} --> local[{}] <--> peer[{}]",
+                    &tun_name, &subnet, &ip
+                );
 
                 // Main loop for packet processing
                 panic::catch_unwind(|| {
@@ -747,7 +762,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .about("tunpdf a pdf encapsulation for point-to-point networks implementation.")
             .arg(
                 Arg::new("ip")
-                    .help("The IP address of the server")
+                    .help("The IP address of the peer")
                     .required(true)
                     .action(ArgAction::Set)
                     .short('i')

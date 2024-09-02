@@ -283,18 +283,26 @@ fn set_ipv4_payload(packet: &mut MutableIpv4Packet, payload: &[u8]) {
     packet.set_checksum(checksum);
 }
 
-fn send(packet: Ipv4Packet) -> Ipv4Packet {
+fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     // takes the machine's request encrypt & zlib processes it into a PDF file for transport.
     let mut base64 = String::new();
 
     // Parse the packet
-
-    // Extract the payload (datagram)
     let payload = packet.payload();
+
+    // extract destination ip from the packet
+    let dst_from_packet: Ipv4Addr = packet.get_destination();
+    let dst_from_packet_slice = dst_from_packet.octets();
+    let dst_from_packet_slice: &[u8] = dst_from_packet_slice.borrow();
+
     //println!("Payload data: {:?}", payload);
     let ipv4_header_len = packet.get_header_length() as usize * 4; // Typical length of IPv4 header
     let datagram = packpdf(payload, &mut base64); // KEEP THAT LINE TRUE.
     let buffer_len = ipv4_header_len + datagram.len();
+    let datagram = datagram.borrow();
+
+    // Extract the payload (datagram) to concatenate after the original destination ip.
+    let datagram = [dst_from_packet_slice, datagram].concat();
     let datagram = datagram.borrow();
 
     let mut buffer = vec![0u8; buffer_len];
@@ -314,7 +322,7 @@ fn send(packet: Ipv4Packet) -> Ipv4Packet {
     new_packet.set_next_level_protocol(packet.get_next_level_protocol());
     new_packet.set_checksum(packet.get_checksum());
     new_packet.set_source(packet.get_source());
-    new_packet.set_destination(packet.get_destination());
+    new_packet.set_destination(forged_dst_ip);
 
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, datagram); //KEEP THAT LINE TRUE!
@@ -327,6 +335,11 @@ fn receive(packet: Ipv4Packet) -> Ipv4Packet {
     let mut base64 = String::new();
 
     let payload = packet.payload();
+
+    // Extract original destination for packet from payload's first 4 bytes..
+    let original_dst: Ipv4Addr = Ipv4Addr::from([payload[0], payload[1], payload[2], payload[3]]);
+
+    let payload = &payload[4..];
 
     let _ = packpdf(payload, &mut base64); // KEEP THAT LINE TRUE!
 
@@ -346,7 +359,7 @@ fn receive(packet: Ipv4Packet) -> Ipv4Packet {
     new_packet.set_next_level_protocol(packet.get_next_level_protocol());
     new_packet.set_checksum(packet.get_checksum());
     new_packet.set_source(packet.get_source());
-    new_packet.set_destination(packet.get_destination());
+    new_packet.set_destination(original_dst);
 
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, base64.as_bytes()); //KEEP THAT LINE TRUE!
@@ -668,9 +681,9 @@ fn valid_ip(ip: &str) -> bool {
 fn get_available_subnet() -> Option<String> {
     // Define the non-routable zones
     let non_routable_zones = [
-        ("10.0.0.0/8", "10.0.0.1", "255.255.255.0"),
-        ("172.16.0.0/12", "172.16.0.1", "255.240.0.0"),
-        ("192.168.0.0/16", "192.168.0.1", "255.255.0.0"),
+        ("10.0.0.0/8", "10.0.0.1", "255.255.255.255"),
+        ("172.16.0.0/12", "172.16.0.1", "255.255.255.255"),
+        ("192.168.0.0/16", "192.168.0.1", "255.255.255.255"),
     ];
 
     // Get a list of network interfaces and their IP addresses
@@ -788,19 +801,29 @@ fn del_route(routable: &str, dev: &str) {
         .expect("Failed to remove route for tun interface");
 }
 
-fn networked(ip: &str) {
+fn networked(ip: &str, client_ip: Option<&str>) {
     let available_subnet = get_available_subnet();
     if let Some(subnet) = available_subnet {
         let tun_name = get_available_tun_name();
         let mut config = tun::Configuration::default();
         let parts: Vec<&str> = subnet.split_whitespace().collect();
-        config
-            .address(parts[0])
-            .netmask(parts[1])
-            .mtu(1500)
-            .name(&tun_name)
-            .destination(ip)
-            .up();
+        if is_server() {
+            config
+                .address(parts[0])
+                .netmask(parts[1])
+                .mtu(1500)
+                .name(&tun_name)
+                .destination(ip)
+                .up();
+        } else {
+            config
+                .address(client_ip.unwrap())
+                .netmask(parts[1])
+                .mtu(1500)
+                .name(&tun_name)
+                .destination(ip)
+                .up();
+        }
 
         // Create the TUN device
         match Device::new(&config) {
@@ -810,7 +833,9 @@ fn networked(ip: &str) {
                     println!(
                         //Client Peer Mode.
                         "TUN device created: {} --> local[{}] <--> peer[{}]",
-                        &tun_name, &subnet, &ip
+                        &tun_name,
+                        client_ip.unwrap(),
+                        &ip
                     );
                 } else {
                     println!(
@@ -831,6 +856,11 @@ fn networked(ip: &str) {
                 // Main loop for packet processing
                 panic::catch_unwind(|| {
                     let mut buf = [0u8; 1504];
+                    let mut ip_bytes: [u8; 4] = [0; 4];
+                    let parts: Vec<&str> = ip.split('.').collect();
+                    for (i, part) in parts.iter().enumerate() {
+                        ip_bytes[i] = part.parse::<u8>().unwrap();
+                    }
 
                     loop {
                         let nbytes = match dev.lock().unwrap().read(&mut buf) {
@@ -857,14 +887,10 @@ fn networked(ip: &str) {
                                         }
                                     } else {
                                         //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
-                                        let sent_packet = send(packet);
+                                        let sent_packet = send(packet, Ipv4Addr::from(ip_bytes));
                                         if let Err(e) =
                                             dev.lock().unwrap().write(sent_packet.packet())
                                         {
-                                            println!(
-                                                "PACKET-Size={}",
-                                                sent_packet.get_total_length()
-                                            );
                                             print_error(&tun_name, e);
                                         }
                                     }
@@ -913,6 +939,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .value_name("IP"),
             )
             .arg(
+                Arg::new("client_ip")
+                    .help("The LOCAL IP address of the CLIENT peer on the server's subnet")
+                    .required(false)
+                    .action(ArgAction::Set)
+                    .short('c')
+                    .long("client_ip")
+                    .value_name("CLIENT_IP"),
+            )
+            .arg(
                 Arg::new("otp")
                     .help("The OTP from the SERVER (Client Peer Mode)")
                     .required(false)
@@ -924,50 +959,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cloned_switches = switches.clone();
 
         let arguments = switches.get_matches();
-
+        let mut client_ip = "";
         update_secret(generate_fips());
         if let Some(mut otp) = arguments.try_get_raw("otp").ok().flatten() {
             println!("Running in CLIENT peer mode...");
             let otp = otp.next().unwrap().to_str().unwrap();
-            init_otp(otp.parse::<u64>().expect("ERROR parsing OTP!"))
+            init_otp(otp.parse::<u64>().expect("ERROR parsing OTP!"));
+            match arguments.try_get_raw("client_ip") {
+                Ok(Some(mut ip_client)) => {
+                    if let Some(ip) = ip_client.next() {
+                        client_ip = ip.to_str().unwrap();
+                    }
+                }
+                Ok(None) => {
+                    println!("Please use switch --client_ip [some valid server subnet ip]");
+                    exit_program();
+                }
+                Err(error) => {
+                    println!(
+                        "Please use switch --client_ip [some valid server subnet ip]-->Error:{}",
+                        error
+                    );
+                    exit_program();
+                }
+            }
         } else {
             init_server();
             println!("Running in SERVER peer mode...");
             init_otp(generate_totp(get_secret()));
         }
 
-        let ip_option = arguments.get_raw("ip");
-        if let Some(ip_values) = ip_option {
-            for ip in ip_values {
-                if let Some(ip_str) = ip.to_str() {
-                    if valid_ip(ip_str) || ip_str == "localhost" {
-                        networked(ip_str);
-                    } else {
-                        println!("Please enter a valid ip address.");
-                        let _ = cloned_switches.print_long_help();
-                    }
-                } else {
-                    eprintln!("Error parsing IP address.");
-                    let _ = cloned_switches.print_long_help();
-                }
-            }
-        } else {
-            eprintln!("No IP address provided.");
-            let _ = cloned_switches.print_long_help();
-        }
-        /*
-        match arguments.get_raw("ip") {
+        match arguments.try_get_raw("ip") {
             Ok(ip_option) => {
                 let ip = ip_option.unwrap().next().unwrap().to_str().unwrap();
-                if valid_ip(ip) {
-                    networked(ip);
-                } else {
-                    if ip == "localhost" {
-                        networked(ip);
+                if valid_ip(ip) || ip == "localhost" {
+                    if is_server() {
+                        networked(ip, None);
                     } else {
-                        println!("Please enter a valid ip address.");
-                        let _ = cloned_switches.print_long_help();
+                        networked(ip, Some(client_ip));
                     }
+                } else {
+                    println!("Please enter a valid ip address.");
+                    let _ = cloned_switches.print_long_help();
                 }
             }
             Err(error) => {
@@ -975,7 +1008,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = cloned_switches.print_long_help();
             }
         }
-        */
     } else {
         update_secret(generate_fips());
         let mut buffer = Vec::new();

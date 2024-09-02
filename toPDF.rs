@@ -1,9 +1,11 @@
 extern crate aes;
 extern crate base32;
 extern crate clap;
-extern crate hex; //TODO: Clap an argument to require otp challenge with the client peer and print otp from server side. (not provided as input)
-extern crate hmac; //TODO: Add a clap switch to be provided a otp key auth from server peer to client peer.
-extern crate libc; //TODO: Build route on both peers automatically.
+extern crate ctrlc;
+extern crate hex;
+extern crate hkdf;
+extern crate hmac;
+extern crate libc;
 extern crate lopdf;
 extern crate pnet;
 extern crate printpdf;
@@ -16,8 +18,8 @@ use aes::cipher::{typenum, Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyIni
 use aes::*;
 use base32::Alphabet;
 use clap::{Arg, ArgAction};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
 use printpdf::*;
@@ -46,9 +48,15 @@ const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
 
 static INIT: Once = Once::new();
 static INIT2: Once = Once::new();
+static INIT3: Once = Once::new();
+static INIT4: Once = Once::new();
+static INIT5: Once = Once::new();
 static mut SECRET: Option<String> = None;
 static mut OTP: u64 = 0;
 static mut IN_SYNC: bool = false;
+static mut SERVER: bool = false;
+static mut IFACE: String = String::new();
+static mut ROUTED: String = String::new();
 
 #[cfg(target_family = "unix")]
 fn is_elevated() -> bool {
@@ -72,6 +80,34 @@ fn init_otp(otp: u64) {
     }
 }
 
+fn is_server() -> bool {
+    unsafe { SERVER }
+}
+
+fn init_server() {
+    unsafe {
+        INIT3.call_once(|| {
+            SERVER = true;
+        });
+    }
+}
+
+fn init_iface(iface: String) {
+    unsafe {
+        INIT4.call_once(|| {
+            IFACE = iface;
+        });
+    }
+}
+
+fn init_routed(routable: String) {
+    unsafe {
+        INIT5.call_once(|| {
+            ROUTED = routable;
+        });
+    }
+}
+
 fn update_secret(secret: String) {
     init_secret(secret);
 }
@@ -90,6 +126,26 @@ fn get_otp() -> u64 {
         let otp = otp_clone;
         otp
     }
+}
+
+fn hkdf_derive_key(initial_key: u64) -> u64 {
+    let initial_key_bytes = initial_key.to_be_bytes(); // 8 bytes
+
+    // Use HKDF to derive a longer key
+    let hk = Hkdf::<Sha512>::new(None, &initial_key_bytes);
+    let mut okm = [0u8; 128]; // 128 bytes output
+    hk.expand(&[], &mut okm)
+        .expect("OKM generation should not fail");
+
+    let mut hmac = Hmac::<Sha512>::new_from_slice(&okm).expect("HMAC can take key of any size");
+
+    let time = (OffsetDateTime::now_utc().unix_timestamp() / 60).to_be_bytes();
+    hmac.update(&time); //TODO: Do better than this in the future.
+    let digest = hmac.finalize();
+    let bytes = digest.into_bytes();
+    let mut truncated_bytes = [0u8; 8];
+    truncated_bytes.copy_from_slice(&bytes[..8]);
+    u64::from_be_bytes(truncated_bytes)
 }
 
 fn generate_fips() -> String {
@@ -184,34 +240,7 @@ fn pad(data: Vec<u8>) -> Vec<u8> {
     padded_data.extend(vec![0; padding]);
     padded_data
 }
-/*
-fn test_encryption() -> bool {
-    let mut original = String::from("TEST HELLO WORLD! ENCRYPTION");
 
-    let padding = original.len() % 16;
-    //println!("{}", padding);
-    if padding > 0 {
-        for _ in 0..(16 - padding) {
-            original += " ";
-        }
-    }
-
-    let otp = generate_totp(SECRET);
-    let encrypted = encrypt(original.into_bytes(), otp);
-
-    println!(
-        "ENCRYPTED:{:#?}",
-        String::from_utf8_lossy(encrypted.borrow())
-    );
-
-    let otp = generate_totp(SECRET);
-    let decrypted = decrypt(encrypted, otp);
-
-    println!("DECRYPTED:{:#?}", String::from_utf8(decrypted));
-
-    true
-}
-*/
 fn generate_totp(secret: String) -> u64 {
     let key =
         base32::decode(Alphabet::RFC4648 { padding: false }, &secret).expect("Invalid secret");
@@ -235,7 +264,26 @@ fn generate_totp(secret: String) -> u64 {
     code % 1_0000_0000
 }
 
-fn send(packet: Ipv4Packet) -> Vec<u8> {
+fn set_ipv4_payload(packet: &mut MutableIpv4Packet, payload: &[u8]) {
+    let header_len = packet.get_header_length() as usize * 4;
+    let total_len = header_len + payload.len();
+    // Ensure the buffer is large enough before setting the payload
+    if packet.packet().len() < total_len {
+        panic!("Buffer is not large enough to hold the payload");
+    }
+
+    // Calculate and set the total length (header length + payload length)
+    packet.set_total_length(total_len as u16);
+
+    // Set the payload
+    packet.set_payload(payload);
+
+    // Optionally recalculate the checksum
+    let checksum = pnet::util::checksum(packet.packet(), 1);
+    packet.set_checksum(checksum);
+}
+
+fn send(packet: Ipv4Packet) -> Ipv4Packet {
     // takes the machine's request encrypt & zlib processes it into a PDF file for transport.
     let mut base64 = String::new();
 
@@ -244,44 +292,66 @@ fn send(packet: Ipv4Packet) -> Vec<u8> {
     // Extract the payload (datagram)
     let payload = packet.payload();
     //println!("Payload data: {:?}", payload);
-
-    let datagram = packpdf(payload, &mut base64);
+    let ipv4_header_len = packet.get_header_length() as usize * 4; // Typical length of IPv4 header
+    let datagram = packpdf(payload, &mut base64); // KEEP THAT LINE TRUE.
+    let buffer_len = ipv4_header_len + datagram.len();
     let datagram = datagram.borrow();
 
-    // Create a mutable packet
-    let mut new_packet = MutableIpv4Packet::owned(packet.packet().to_vec()).unwrap();
+    let mut buffer = vec![0u8; buffer_len];
 
-    // Set headers (you can copy from the original or modify them)
+    let mut new_packet = MutableIpv4Packet::new(&mut buffer[..]).unwrap();
+
+    // Copy fields from original packet to new packet
+    new_packet.set_version(packet.get_version());
+    new_packet.set_header_length(packet.get_header_length());
+    new_packet.set_dscp(packet.get_dscp());
+    new_packet.set_ecn(packet.get_ecn());
+    new_packet.set_total_length(packet.get_total_length());
+    new_packet.set_identification(packet.get_identification());
+    new_packet.set_flags(packet.get_flags());
+    new_packet.set_fragment_offset(packet.get_fragment_offset());
+    new_packet.set_ttl(packet.get_ttl());
+    new_packet.set_next_level_protocol(packet.get_next_level_protocol());
+    new_packet.set_checksum(packet.get_checksum());
     new_packet.set_source(packet.get_source());
     new_packet.set_destination(packet.get_destination());
-    new_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
 
     // Replace the old payload with the new one
-    new_packet.set_payload(datagram);
+    set_ipv4_payload(&mut new_packet, datagram); //KEEP THAT LINE TRUE!
 
-    // Now, `new_packet` contains the modified IP packet
-    new_packet.packet().to_vec()
+    Ipv4Packet::owned(new_packet.packet().to_vec()).unwrap()
 }
 
-fn receive(packet: Ipv4Packet) -> Vec<u8> {
+fn receive(packet: Ipv4Packet) -> Ipv4Packet {
     // process a request from the far-end tun device into a request processed either near or far depending on the request's origin.
     let mut base64 = String::new();
 
     let payload = packet.payload();
 
-    let _ = packpdf(payload, &mut base64);
+    let _ = packpdf(payload, &mut base64); // KEEP THAT LINE TRUE!
 
-    let mut new_packet = MutableIpv4Packet::owned(packet.packet().to_vec()).unwrap();
+    let mut buffer = vec![0u8; packet.packet().len()];
+    let mut new_packet = MutableIpv4Packet::new(&mut buffer[..]).unwrap();
 
-    // Set headers (you can copy from the original or modify them)
+    // Copy fields from original packet to new packet
+    new_packet.set_version(packet.get_version());
+    new_packet.set_header_length(packet.get_header_length());
+    new_packet.set_dscp(packet.get_dscp());
+    new_packet.set_ecn(packet.get_ecn());
+    new_packet.set_total_length(packet.get_total_length());
+    new_packet.set_identification(packet.get_identification());
+    new_packet.set_flags(packet.get_flags());
+    new_packet.set_fragment_offset(packet.get_fragment_offset());
+    new_packet.set_ttl(packet.get_ttl());
+    new_packet.set_next_level_protocol(packet.get_next_level_protocol());
+    new_packet.set_checksum(packet.get_checksum());
     new_packet.set_source(packet.get_source());
     new_packet.set_destination(packet.get_destination());
-    new_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
 
     // Replace the old payload with the new one
-    new_packet.set_payload(base64.as_bytes());
+    set_ipv4_payload(&mut new_packet, base64.as_bytes()); //KEEP THAT LINE TRUE!
 
-    new_packet.packet().to_vec()
+    Ipv4Packet::owned(new_packet.packet().to_vec()).unwrap()
 }
 
 fn packpdf(buffer: &[u8], base64: &mut String) -> Vec<u8> {
@@ -508,9 +578,10 @@ fn processpdf(doc: PdfDocumentReference, base64: &mut String) -> Vec<u8> {
                                 let mut document = lopdf::Document::with_version("1.5");
                                 let content_stream = lopdf::Stream::new(
                                     result.clone(),
-                                    encrypt(data, generate_totp(get_secret())),
+                                    encrypt(data, hkdf_derive_key(get_otp())),
                                 )
                                 .with_compression(true);
+
                                 let stream_id = document.add_object(content_stream);
                                 document.compress();
                                 let _ = document.save_to(&mut buffer);
@@ -537,14 +608,13 @@ fn processpdf(doc: PdfDocumentReference, base64: &mut String) -> Vec<u8> {
 
                                     let decrypted;
                                     unsafe {
-                                        if !IN_SYNC && OTP == 0 || IN_SYNC == true {
+                                        if IN_SYNC == true {
                                             decrypted = decrypt(
                                                 encrypted_content,
-                                                generate_totp(get_secret()),
+                                                hkdf_derive_key(get_otp()),
                                             );
                                         } else {
                                             IN_SYNC = true;
-                                            generate_totp(get_secret());
                                             decrypted = decrypt(encrypted_content, get_otp());
                                         }
                                     }
@@ -627,10 +697,12 @@ fn get_available_subnet() -> Option<String> {
             // Check if the IP is already in use
             let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
             let mut ip_in_use = false;
+            let mut dev = "";
             for line in lines.iter() {
                 if line.contains("inet") && !line.contains("inet6") {
                     //IPV4 only
                     let parts: Vec<&str> = line.split_whitespace().collect();
+                    dev = *parts.last().unwrap();
                     let existing_ip_addr = parts[1].split('/').next().unwrap();
                     let existing_ip_addr = existing_ip_addr.parse::<Ipv4Addr>().unwrap();
                     if existing_ip_addr == ip_addr {
@@ -643,8 +715,8 @@ fn get_available_subnet() -> Option<String> {
             // If the IP is not in use, return it
             if !ip_in_use {
                 return Some(format!(
-                    "{}.{}.{}.{} {}",
-                    ip[0], ip[1], ip[2], ip[3], netmask
+                    "{}.{}.{}.{} {} {} {}.{}.{}.0/24",
+                    ip[0], ip[1], ip[2], ip[3], netmask, dev, ip[0], ip[1], ip[2]
                 ));
             }
         }
@@ -694,11 +766,30 @@ fn print_error(tun_name: &str, error: std::io::Error) {
     eprintln!("Failed to write to tun device {}: {}", tun_name, error);
 }
 
-fn networked(secret: String, ip: &str) {
+fn set_route(routable: &str, dev: &str) {
+    let _output = Command::new("ip")
+        .arg("route")
+        .arg("add")
+        .arg(routable)
+        .arg("dev")
+        .arg(dev)
+        .output()
+        .expect("Failed to add route for tun interface");
+}
+
+fn del_route(routable: &str, dev: &str) {
+    let _output = Command::new("ip")
+        .arg("route")
+        .arg("del")
+        .arg(routable)
+        .arg("dev")
+        .arg(dev)
+        .output()
+        .expect("Failed to remove route for tun interface");
+}
+
+fn networked(ip: &str) {
     let available_subnet = get_available_subnet();
-
-    update_secret(secret);
-
     if let Some(subnet) = available_subnet {
         let tun_name = get_available_tun_name();
         let mut config = tun::Configuration::default();
@@ -708,13 +799,14 @@ fn networked(secret: String, ip: &str) {
             .netmask(parts[1])
             .mtu(1500)
             .name(&tun_name)
-            .destination(ip);
+            .destination(ip)
+            .up();
 
         // Create the TUN device
         match Device::new(&config) {
             Ok(dev) => {
                 let dev = Arc::new(Mutex::new(dev));
-                if get_otp() == 0 {
+                if !is_server() {
                     println!(
                         //Client Peer Mode.
                         "TUN device created: {} --> local[{}] <--> peer[{}]",
@@ -729,7 +821,13 @@ fn networked(secret: String, ip: &str) {
                         get_otp()
                     );
                 }
-
+                let ifname = parts[2];
+                let routable = parts[3];
+                set_route(routable, ifname);
+                //if_up(&tun_name);
+                init_iface(ifname.to_string());
+                init_routed(routable.to_string());
+                //
                 // Main loop for packet processing
                 panic::catch_unwind(|| {
                     let mut buf = [0u8; 1504];
@@ -743,29 +841,40 @@ fn networked(secret: String, ip: &str) {
                             }
                         };
 
-                        if let Some(packet) = Ipv4Packet::new(&buf[..nbytes]) {
-                            let dst_ip = packet.get_destination();
+                        if nbytes > 0 {
+                            if let Some(packet) = Ipv4Packet::new(&buf[..nbytes]) {
+                                let dst_ip = packet.get_destination();
+                                let src_ip = packet.get_source();
 
-                            if dst_ip.to_string() == parts[0] {
-                                // Ingress traffic (from network to TUN interface)
-                                let decoded_packet = receive(packet);
-                                if let Err(e) =
-                                    dev.lock().unwrap().write_all(&decoded_packet.borrow())
-                                {
-                                    print_error(&tun_name, e);
-                                }
-                            } else {
-                                //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
-                                let sent_packet = send(packet);
-                                if let Err(e) = dev.lock().unwrap().write_all(&sent_packet.borrow())
-                                {
-                                    print_error(&tun_name, e);
+                                if src_ip.to_string() != "0.0.0.0" {
+                                    if dst_ip.to_string() == parts[0] {
+                                        // Ingress traffic (from network to TUN interface)
+                                        let decoded_packet = receive(packet);
+                                        if let Err(e) =
+                                            dev.lock().unwrap().write(decoded_packet.packet())
+                                        {
+                                            print_error(&tun_name, e);
+                                        }
+                                    } else {
+                                        //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
+                                        let sent_packet = send(packet);
+                                        if let Err(e) =
+                                            dev.lock().unwrap().write(sent_packet.packet())
+                                        {
+                                            println!(
+                                                "PACKET-Size={}",
+                                                sent_packet.get_total_length()
+                                            );
+                                            print_error(&tun_name, e);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 })
                 .unwrap_or_else(|_| {
+                    del_route(routable, ifname);
                     exit_program();
                 });
             }
@@ -779,8 +888,14 @@ fn networked(secret: String, ip: &str) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //test_encryption();
-    //std::process::exit(0);
+    ctrlc::set_handler(move || {
+        println!("Received SIGINT, exiting...");
+        unsafe {
+            del_route(ROUTED.borrow(), IFACE.borrow());
+        }
+        exit_program()
+    })
+    .expect("Error setting Ctrl-C handler");
 
     let mut base64 = String::new();
     if is_elevated() {
@@ -816,18 +931,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let otp = otp.next().unwrap().to_str().unwrap();
             init_otp(otp.parse::<u64>().expect("ERROR parsing OTP!"))
         } else {
-            eprintln!("Running in SERVER peer mode...");
+            init_server();
+            println!("Running in SERVER peer mode...");
             init_otp(generate_totp(get_secret()));
         }
 
-        match arguments.try_get_raw("ip") {
+        let ip_option = arguments.get_raw("ip");
+        if let Some(ip_values) = ip_option {
+            for ip in ip_values {
+                if let Some(ip_str) = ip.to_str() {
+                    if valid_ip(ip_str) || ip_str == "localhost" {
+                        networked(ip_str);
+                    } else {
+                        println!("Please enter a valid ip address.");
+                        let _ = cloned_switches.print_long_help();
+                    }
+                } else {
+                    eprintln!("Error parsing IP address.");
+                    let _ = cloned_switches.print_long_help();
+                }
+            }
+        } else {
+            eprintln!("No IP address provided.");
+            let _ = cloned_switches.print_long_help();
+        }
+        /*
+        match arguments.get_raw("ip") {
             Ok(ip_option) => {
                 let ip = ip_option.unwrap().next().unwrap().to_str().unwrap();
                 if valid_ip(ip) {
-                    networked(get_secret(), ip);
+                    networked(ip);
                 } else {
                     if ip == "localhost" {
-                        networked(get_secret(), ip);
+                        networked(ip);
                     } else {
                         println!("Please enter a valid ip address.");
                         let _ = cloned_switches.print_long_help();
@@ -839,6 +975,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = cloned_switches.print_long_help();
             }
         }
+        */
     } else {
         update_secret(generate_fips());
         let mut buffer = Vec::new();

@@ -3,7 +3,7 @@ extern crate base32;
 extern crate clap;
 extern crate ctrlc;
 extern crate hex;
-extern crate hkdf;
+extern crate hkdf; //TODO:FORGE THE UDP TOTAL LENGTH = packet size - headers(20 bytes)
 extern crate hmac;
 extern crate libc;
 extern crate lopdf;
@@ -266,14 +266,10 @@ fn generate_totp(secret: String) -> u64 {
 
 fn set_ipv4_payload(packet: &mut MutableIpv4Packet, payload: &[u8]) {
     let header_len = packet.get_header_length() as usize * 4;
-    let total_len = header_len + payload.len();
-    // Ensure the buffer is large enough before setting the payload
-    if packet.packet().len() < total_len {
-        panic!("Buffer is not large enough to hold the payload");
-    }
+    let total_len = (header_len + payload.len()) as u16;
 
     // Calculate and set the total length (header length + payload length)
-    packet.set_total_length(total_len as u16);
+    packet.set_total_length(total_len.to_be());
 
     // Set the payload
     packet.set_payload(payload);
@@ -298,12 +294,13 @@ fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     //println!("Payload data: {:?}", payload);
     let ipv4_header_len = packet.get_header_length() as usize * 4; // Typical length of IPv4 header
     let datagram = packpdf(payload, &mut base64); // KEEP THAT LINE TRUE.
-    let buffer_len = ipv4_header_len + datagram.len();
     let datagram = datagram.borrow();
 
     // Extract the payload (datagram) to concatenate after the original destination ip.
     let datagram = [dst_from_packet_slice, datagram].concat();
-    let datagram = datagram.borrow();
+    let datagram: &[u8] = datagram.borrow();
+
+    let buffer_len = ipv4_header_len + datagram.len();
 
     let mut buffer = vec![0u8; buffer_len];
 
@@ -314,15 +311,16 @@ fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     new_packet.set_header_length(packet.get_header_length());
     new_packet.set_dscp(packet.get_dscp());
     new_packet.set_ecn(packet.get_ecn());
-    new_packet.set_total_length(packet.get_total_length());
+    new_packet.set_total_length(0);
     new_packet.set_identification(packet.get_identification());
     new_packet.set_flags(packet.get_flags());
     new_packet.set_fragment_offset(packet.get_fragment_offset());
     new_packet.set_ttl(packet.get_ttl());
     new_packet.set_next_level_protocol(packet.get_next_level_protocol());
-    new_packet.set_checksum(packet.get_checksum());
+    new_packet.set_checksum(0);
     new_packet.set_source(packet.get_source());
     new_packet.set_destination(forged_dst_ip);
+    new_packet.set_options(&packet.get_options());
 
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, datagram); //KEEP THAT LINE TRUE!
@@ -360,6 +358,7 @@ fn receive(packet: Ipv4Packet) -> Ipv4Packet {
     new_packet.set_checksum(packet.get_checksum());
     new_packet.set_source(packet.get_source());
     new_packet.set_destination(original_dst);
+    new_packet.set_options(&packet.get_options());
 
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, base64.as_bytes()); //KEEP THAT LINE TRUE!

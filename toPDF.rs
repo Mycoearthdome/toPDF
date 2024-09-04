@@ -3,7 +3,7 @@ extern crate base32;
 extern crate clap;
 extern crate ctrlc;
 extern crate hex;
-extern crate hkdf; //TODO:FORGE THE UDP TOTAL LENGTH = packet size - headers(20 bytes)
+extern crate hkdf; //adjust statefull firewalls OFF.
 extern crate hmac;
 extern crate libc;
 extern crate lopdf;
@@ -20,8 +20,11 @@ use base32::Alphabet;
 use clap::{Arg, ArgAction};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use pnet::packet::ip::IpNextHeaderProtocols::Ipv4;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
+use pnet::transport;
+use pnet::transport::TransportChannelType::Layer3;
 use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
@@ -30,6 +33,7 @@ use std::borrow::{Borrow, BorrowMut};
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
+use std::net::IpAddr::V4;
 use std::net::{IpAddr, Ipv4Addr};
 use std::panic;
 use std::process;
@@ -269,7 +273,7 @@ fn set_ipv4_payload(packet: &mut MutableIpv4Packet, payload: &[u8]) {
     let total_len = (header_len + payload.len()) as u16;
 
     // Calculate and set the total length (header length + payload length)
-    packet.set_total_length(total_len.to_be());
+    packet.set_total_length(total_len);
 
     // Set the payload
     packet.set_payload(payload);
@@ -800,6 +804,17 @@ fn del_route(routable: &str, dev: &str) {
         .expect("Failed to remove route for tun interface");
 }
 
+fn push_packet(packet: Ipv4Packet) {
+    // Create a transport sender
+    let (mut sender, _) = transport::transport_channel(1500, Layer3(Ipv4)).unwrap();
+
+    // Extract the destination before moving the packet
+    let destination = packet.get_destination();
+
+    // Send the packet
+    let _ = sender.send_to(packet, V4(destination));
+}
+
 fn networked(ip: &str, client_ip: Option<&str>) {
     let available_subnet = get_available_subnet();
     if let Some(subnet) = available_subnet {
@@ -879,11 +894,7 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                                     if dst_ip.to_string() == parts[0] {
                                         // Ingress traffic (from network to TUN interface)
                                         let decoded_packet = receive(packet);
-                                        if let Err(e) =
-                                            dev.lock().unwrap().write(decoded_packet.packet())
-                                        {
-                                            print_error(&tun_name, e);
-                                        }
+                                        push_packet(decoded_packet)
                                     } else {
                                         //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
                                         let sent_packet = send(packet, Ipv4Addr::from(ip_bytes));

@@ -840,7 +840,10 @@ fn networked(ip: &str, client_ip: Option<&str>) {
         let ip: Ipv4Addr = ip.parse().expect("Invalid IP address format");
         let netmask: Ipv4Addr = parts[1].parse().expect("Invalid IP address format");
         let address: Ipv4Addr = parts[0].parse().expect("Invalid IP address format");
-        let num_queues = 64;
+        let broadcast: Ipv4Addr = "255.255.255.255"
+            .parse()
+            .expect("Invalid IP address format");
+        let num_queues = 56;
         if is_server() {
             config
                 .address(address)
@@ -849,6 +852,7 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                 .name(&tun_name)
                 .destination(ip)
                 .queues(num_queues)
+                .broadcast(broadcast)
                 .up();
         } else {
             let client_ip = client_ip.unwrap();
@@ -861,11 +865,14 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                 .name(&tun_name)
                 .destination(ip)
                 .queues(num_queues)
+                .broadcast(broadcast)
                 .up();
         }
 
         // Create the TUN device
         let dev = Arc::new(Mutex::new(Tun_Device::new(&config)));
+        let dev_enabled = Arc::clone(&dev);
+        let _ = dev_enabled.lock().unwrap().as_mut().unwrap().enabled(true);
         if !is_server() {
             println!(
                 //Client Peer Mode.
@@ -899,18 +906,17 @@ fn networked(ip: &str, client_ip: Option<&str>) {
 
                 // Spawn a thread for each queue
                 for i in 0..num_queues {
-                    let tun_clone = Arc::clone(&dev); // Create a shared reference to the dev variable
+                    let tun_clone = Arc::clone(&dev_enabled); // Create a shared reference to the dev variable
                     let tun_name_clone = tun_name.clone(); // Clone the tun_name variable
                     let handle = thread::spawn(move || {
                         let mut buffer = [0u8; 1504]; // MTU + 4 bytes TUN header
                         let mut tun_guard = tun_clone.lock().expect("Failed to lock tun device");
-                        let mut tun_guard2 = tun_clone.lock().expect("Failed to lock tun device");
                         if let Some(queue) = tun_guard.as_mut().unwrap().queue(i) {
-                            let tun_device = tun_guard2.as_mut().unwrap(); // Clone the tun_guard variable
-                                                                           // Read data from the tun interface
+                            // Read data from the tun interface
                             match queue.read(&mut buffer) {
                                 Ok(n) => {
-                                    println!("Queue {}: Read {} bytes", i, n);
+                                    let _ = queue.flush();
+                                    println!("Received {} bytes from TUN device", n);
                                     if n > 0 {
                                         if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
                                             let dst_ip = packet.get_destination();
@@ -928,11 +934,12 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                                                     //push_packet(decoded_packet)
                                                     //push_stdout(decoded_packet);
                                                     if let Err(e) =
-                                                        tun_device.write(decoded_packet.packet())
+                                                        queue.write(decoded_packet.packet())
                                                     {
                                                         print_error(&tun_name_clone, e);
                                                         // Use the cloned tun_name variable
                                                     }
+                                                    let _ = queue.flush();
                                                 } else {
                                                     //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
                                                     println!(
@@ -942,11 +949,12 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                                                     );
                                                     let sent_packet = send(packet, ip);
                                                     if let Err(e) =
-                                                        tun_device.write(sent_packet.packet())
+                                                        queue.write(sent_packet.packet())
                                                     {
                                                         print_error(&tun_name_clone, e);
                                                         // Use the cloned tun_name variable
                                                     }
+                                                    let _ = queue.flush();
                                                 }
                                             }
                                         }
@@ -956,7 +964,7 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                             }
                         }
                     });
-
+                    //println!("Thread {} started", i);
                     // Store thread handles
                     threads.push(handle);
                 }

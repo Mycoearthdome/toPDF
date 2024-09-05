@@ -20,27 +20,26 @@ use base32::Alphabet;
 use clap::{Arg, ArgAction};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pnet::packet::ip::IpNextHeaderProtocols::Ipv4;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
-use pnet::transport;
-use pnet::transport::TransportChannelType::Layer3;
+
 use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
+use std::thread;
 
 use std::borrow::{Borrow, BorrowMut};
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
-use std::net::IpAddr::V4;
 use std::net::{IpAddr, Ipv4Addr};
 use std::panic;
 use std::process;
 use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use time::OffsetDateTime;
-use tun::platform::Device;
+use tun::platform::Device as Tun_Device;
+use tun::Device; // Import the Device trait
 
 // Set the page size to Letter (210.0 x 297.0 mm)
 const MARGIN: f64 = 2.4; // Margin in mm DEFAULT:2.4 for whole page.
@@ -684,9 +683,9 @@ fn valid_ip(ip: &str) -> bool {
 fn get_available_subnet() -> Option<String> {
     // Define the non-routable zones
     let non_routable_zones = [
-        ("10.0.0.0/8", "10.0.0.1", "255.255.255.255"),
-        ("172.16.0.0/12", "172.16.0.1", "255.255.255.255"),
-        ("192.168.0.0/16", "192.168.0.1", "255.255.255.255"),
+        ("10.0.0.0/8", "10.0.0.1", "255.255.255.252"),
+        ("172.16.0.0/12", "172.16.0.1", "255.255.255.252"),
+        ("192.168.0.0/16", "192.168.0.1", "255.255.255.252"),
     ];
 
     // Get a list of network interfaces and their IP addresses
@@ -804,6 +803,7 @@ fn del_route(routable: &str, dev: &str) {
         .expect("Failed to remove route for tun interface");
 }
 
+/*
 fn push_packet(packet: Ipv4Packet) {
     // Create a transport sender
     let (mut sender, _) = transport::transport_channel(1500, Layer3(Ipv4)).unwrap();
@@ -815,109 +815,162 @@ fn push_packet(packet: Ipv4Packet) {
     let _ = sender.send_to(packet, V4(destination));
 }
 
+fn push_stdout(packet: Ipv4Packet) {
+    use std::io::{self, BufWriter, Write};
+
+    let stdout = io::stdout();
+
+    let mut buf_writer = BufWriter::new(stdout.lock());
+    if let Err(err) = buf_writer.write_all(packet.payload()) {
+        eprintln!("Failed to write to stdout: {}", err);
+    }
+    if let Err(err) = buf_writer.flush() {
+        eprintln!("Failed to flush stdout: {}", err);
+    }
+    let _ = buf_writer.flush();
+}
+*/
+
 fn networked(ip: &str, client_ip: Option<&str>) {
     let available_subnet = get_available_subnet();
     if let Some(subnet) = available_subnet {
         let tun_name = get_available_tun_name();
         let mut config = tun::Configuration::default();
         let parts: Vec<&str> = subnet.split_whitespace().collect();
+        let ip: Ipv4Addr = ip.parse().expect("Invalid IP address format");
+        let netmask: Ipv4Addr = parts[1].parse().expect("Invalid IP address format");
+        let address: Ipv4Addr = parts[0].parse().expect("Invalid IP address format");
+        let num_queues = 64;
         if is_server() {
             config
-                .address(parts[0])
-                .netmask(parts[1])
+                .address(address)
+                .netmask(netmask)
                 .mtu(1500)
                 .name(&tun_name)
                 .destination(ip)
+                .queues(num_queues)
                 .up();
         } else {
+            let client_ip = client_ip.unwrap();
+            let client_ip: Ipv4Addr = client_ip.parse().expect("Invalid IP address format");
+            let address = client_ip;
             config
-                .address(client_ip.unwrap())
-                .netmask(parts[1])
+                .address(address)
+                .netmask(netmask)
                 .mtu(1500)
                 .name(&tun_name)
                 .destination(ip)
+                .queues(num_queues)
                 .up();
         }
 
         // Create the TUN device
-        match Device::new(&config) {
-            Ok(dev) => {
-                let dev = Arc::new(Mutex::new(dev));
-                if !is_server() {
-                    println!(
-                        //Client Peer Mode.
-                        "TUN device created: {} --> local[{}] <--> peer[{}]",
-                        &tun_name,
-                        client_ip.unwrap(),
-                        &ip
-                    );
-                } else {
-                    println!(
+        let dev = Arc::new(Mutex::new(Tun_Device::new(&config)));
+        if !is_server() {
+            println!(
+                //Client Peer Mode.
+                "TUN device created: {} --> local[{}] <--> peer[{}]",
+                &tun_name,
+                client_ip.unwrap(),
+                &ip
+            );
+        } else {
+            println!(
                         "TUN device created: {} --> local[{}] <--> peer[{}]\nDon't forget to use --otp {} on the client within 30 sec.",
                         &tun_name,
                         &subnet,
                         &ip,
                         get_otp()
                     );
-                }
-                let ifname = parts[2];
-                let routable = parts[3];
-                set_route(routable, ifname);
-                //if_up(&tun_name);
-                init_iface(ifname.to_string());
-                init_routed(routable.to_string());
-                //
-                // Main loop for packet processing
-                panic::catch_unwind(|| {
-                    let mut buf = [0u8; 1504];
-                    let mut ip_bytes: [u8; 4] = [0; 4];
-                    let parts: Vec<&str> = ip.split('.').collect();
-                    for (i, part) in parts.iter().enumerate() {
-                        ip_bytes[i] = part.parse::<u8>().unwrap();
-                    }
+        }
+        let ifname = parts[2];
+        let routable = parts[3];
+        set_route(routable, ifname);
+        //if_up(&tun_name);
+        init_iface(ifname.to_string());
+        init_routed(routable.to_string());
+        //
+        // Main loop for packet processing
+        panic::catch_unwind(|| {
+            //let mut buf = [0u8; 1504];
+            loop {
+                // Spawn a thread for each queue
+                let mut threads = Vec::new();
 
-                    loop {
-                        let nbytes = match dev.lock().unwrap().read(&mut buf) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                eprintln!("Failed to read from TUN device: {}", e);
-                                continue;
-                            }
-                        };
+                // Spawn a thread for each queue
+                for i in 0..num_queues {
+                    let tun_clone = Arc::clone(&dev); // Create a shared reference to the dev variable
+                    let tun_name_clone = tun_name.clone(); // Clone the tun_name variable
+                    let handle = thread::spawn(move || {
+                        let mut buffer = [0u8; 1504]; // MTU + 4 bytes TUN header
+                        let mut tun_guard = tun_clone.lock().expect("Failed to lock tun device");
+                        let mut tun_guard2 = tun_clone.lock().expect("Failed to lock tun device");
+                        if let Some(queue) = tun_guard.as_mut().unwrap().queue(i) {
+                            let tun_device = tun_guard2.as_mut().unwrap(); // Clone the tun_guard variable
+                                                                           // Read data from the tun interface
+                            match queue.read(&mut buffer) {
+                                Ok(n) => {
+                                    println!("Queue {}: Read {} bytes", i, n);
+                                    if n > 0 {
+                                        if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
+                                            let dst_ip = packet.get_destination();
+                                            let src_ip = packet.get_source();
 
-                        if nbytes > 0 {
-                            if let Some(packet) = Ipv4Packet::new(&buf[..nbytes]) {
-                                let dst_ip = packet.get_destination();
-                                let src_ip = packet.get_source();
-
-                                if src_ip.to_string() != "0.0.0.0" {
-                                    if dst_ip.to_string() == parts[0] {
-                                        // Ingress traffic (from network to TUN interface)
-                                        let decoded_packet = receive(packet);
-                                        push_packet(decoded_packet)
-                                    } else {
-                                        //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
-                                        let sent_packet = send(packet, Ipv4Addr::from(ip_bytes));
-                                        if let Err(e) =
-                                            dev.lock().unwrap().write(sent_packet.packet())
-                                        {
-                                            print_error(&tun_name, e);
+                                            if src_ip.to_string() != "0.0.0.0".to_string() {
+                                                if dst_ip == address {
+                                                    // Ingress traffic (from network to TUN interface)
+                                                    println!(
+                                                        "Received Packet..{}-->{}",
+                                                        src_ip.to_string(),
+                                                        dst_ip.to_string()
+                                                    );
+                                                    let decoded_packet = receive(packet);
+                                                    //push_packet(decoded_packet)
+                                                    //push_stdout(decoded_packet);
+                                                    if let Err(e) =
+                                                        tun_device.write(decoded_packet.packet())
+                                                    {
+                                                        print_error(&tun_name_clone, e);
+                                                        // Use the cloned tun_name variable
+                                                    }
+                                                } else {
+                                                    //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
+                                                    println!(
+                                                        "Sending Packet..{}-->(forged){:#?}",
+                                                        src_ip.to_string(),
+                                                        ip
+                                                    );
+                                                    let sent_packet = send(packet, ip);
+                                                    if let Err(e) =
+                                                        tun_device.write(sent_packet.packet())
+                                                    {
+                                                        print_error(&tun_name_clone, e);
+                                                        // Use the cloned tun_name variable
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                                Err(_e) => {}
                             }
                         }
-                    }
-                })
-                .unwrap_or_else(|_| {
-                    del_route(routable, ifname);
-                    exit_program();
-                });
-            }
-            Err(error) => {
-                eprintln!("Error creating TUN device: {}", error);
-            }
-        }
+                    });
+
+                    // Store thread handles
+                    threads.push(handle);
+                }
+
+                // Wait for all threads to finish
+                for handle in threads {
+                    handle.join().expect("Thread panicked");
+                }
+            } // end loop
+        })
+        .unwrap_or_else(|_| {
+            del_route(routable, ifname);
+            exit_program();
+        });
     } else {
         eprintln!("No available subnet found");
     }

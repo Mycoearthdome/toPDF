@@ -54,12 +54,18 @@ static INIT2: Once = Once::new();
 static INIT3: Once = Once::new();
 static INIT4: Once = Once::new();
 static INIT5: Once = Once::new();
+static INIT6: Once = Once::new();
+static INIT7: Once = Once::new();
+static INIT8: Once = Once::new();
 static mut SECRET: Option<String> = None;
 static mut OTP: u64 = 0;
 static mut IN_SYNC: bool = false;
 static mut SERVER: bool = false;
 static mut IFACE: String = String::new();
 static mut ROUTED: String = String::new();
+static mut CLIENT_IP: String = String::new();
+static mut IP: String = String::new();
+static mut TUN_NAME: String = String::new();
 
 #[cfg(target_family = "unix")]
 fn is_elevated() -> bool {
@@ -111,6 +117,30 @@ fn init_routed(routable: String) {
     }
 }
 
+fn init_client_ip(client_ip: String) {
+    unsafe {
+        INIT6.call_once(|| {
+            CLIENT_IP = client_ip;
+        });
+    }
+}
+
+fn init_ip(ip: String) {
+    unsafe {
+        INIT7.call_once(|| {
+            IP = ip;
+        });
+    }
+}
+
+fn init_tun_name(tun_name: String) {
+    unsafe {
+        INIT8.call_once(|| {
+            TUN_NAME = tun_name;
+        });
+    }
+}
+
 fn update_secret(secret: String) {
     init_secret(secret);
 }
@@ -128,6 +158,27 @@ fn get_otp() -> u64 {
         let otp_clone = OTP.clone();
         let otp = otp_clone;
         otp
+    }
+}
+
+fn get_client_ip() -> String {
+    unsafe {
+        let client_ip = CLIENT_IP.clone();
+        client_ip
+    }
+}
+
+fn get_ip() -> String {
+    unsafe {
+        let ip = IP.clone();
+        ip
+    }
+}
+
+fn get_tun_name() -> String {
+    unsafe {
+        let tun_name = TUN_NAME.clone();
+        tun_name
     }
 }
 
@@ -673,7 +724,7 @@ fn processpdf(doc: PdfDocumentReference, base64: &mut String) -> Vec<u8> {
     buffer
 }
 
-fn valid_ip(ip: &str) -> bool {
+fn valid_ip(ip: String) -> bool {
     match ip.parse::<IpAddr>() {
         Ok(_) => return true,
         Err(_) => return false,
@@ -777,7 +828,7 @@ fn exit_program() {
     process::exit(1);
 }
 
-fn print_error(tun_name: &str, error: std::io::Error) {
+fn print_error(tun_name: String, error: std::io::Error) {
     eprintln!("Failed to write to tun device {}: {}", tun_name, error);
 }
 
@@ -831,19 +882,19 @@ fn push_stdout(packet: Ipv4Packet) {
 }
 */
 
-fn networked(ip: &str, client_ip: Option<&str>) {
+fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
     let available_subnet = get_available_subnet();
     if let Some(subnet) = available_subnet {
-        let tun_name = get_available_tun_name();
+        init_tun_name(get_available_tun_name());
         let mut config = tun::Configuration::default();
         let parts: Vec<&str> = subnet.split_whitespace().collect();
-        let ip: Ipv4Addr = ip.parse().expect("Invalid IP address format");
         let netmask: Ipv4Addr = parts[1].parse().expect("Invalid IP address format");
         let address: Ipv4Addr = parts[0].parse().expect("Invalid IP address format");
         let broadcast: Ipv4Addr = "255.255.255.255"
             .parse()
             .expect("Invalid IP address format");
         let num_queues = 56;
+        let tun_name = get_tun_name();
         if is_server() {
             config
                 .address(address)
@@ -869,16 +920,17 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                 .up();
         }
 
-        // Create the TUN device
-        let dev = Arc::new(Mutex::new(Tun_Device::new(&config)));
-        let dev_enabled = Arc::clone(&dev);
-        let _ = dev_enabled.lock().unwrap().as_mut().unwrap().enabled(true);
+        // Create the TUN device and enable the TUN device
+
+        let dev = Arc::new(Mutex::new(Tun_Device::new(&config).unwrap()));
+        let _ = dev.lock().unwrap().enabled(true);
+        //let dev_enabled = Arc::clone(&dev);
         if !is_server() {
             println!(
                 //Client Peer Mode.
                 "TUN device created: {} --> local[{}] <--> peer[{}]",
                 &tun_name,
-                client_ip.unwrap(),
+                get_client_ip(),
                 &ip
             );
         } else {
@@ -906,12 +958,11 @@ fn networked(ip: &str, client_ip: Option<&str>) {
 
                 // Spawn a thread for each queue
                 for i in 0..num_queues {
-                    let tun_clone = Arc::clone(&dev_enabled); // Create a shared reference to the dev variable
-                    let tun_name_clone = tun_name.clone(); // Clone the tun_name variable
+                    let tun_clone = Arc::clone(&dev); // Create a shared reference to the dev variable
+
                     let handle = thread::spawn(move || {
                         let mut buffer = [0u8; 1504]; // MTU + 4 bytes TUN header
-                        let mut tun_guard = tun_clone.lock().expect("Failed to lock tun device");
-                        if let Some(queue) = tun_guard.as_mut().unwrap().queue(i) {
+                        if let Some(queue) = tun_clone.lock().unwrap().queue(i) {
                             // Read data from the tun interface
                             match queue.read(&mut buffer) {
                                 Ok(n) => {
@@ -936,7 +987,7 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                                                     if let Err(e) =
                                                         queue.write(decoded_packet.packet())
                                                     {
-                                                        print_error(&tun_name_clone, e);
+                                                        print_error(get_tun_name(), e);
                                                         // Use the cloned tun_name variable
                                                     }
                                                     let _ = queue.flush();
@@ -951,7 +1002,7 @@ fn networked(ip: &str, client_ip: Option<&str>) {
                                                     if let Err(e) =
                                                         queue.write(sent_packet.packet())
                                                     {
-                                                        print_error(&tun_name_clone, e);
+                                                        print_error(get_tun_name(), e);
                                                         // Use the cloned tun_name variable
                                                     }
                                                     let _ = queue.flush();
@@ -1030,7 +1081,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cloned_switches = switches.clone();
 
         let arguments = switches.get_matches();
-        let mut client_ip = "";
+
         update_secret(generate_fips());
         if let Some(mut otp) = arguments.try_get_raw("otp").ok().flatten() {
             println!("Running in CLIENT peer mode...");
@@ -1039,7 +1090,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match arguments.try_get_raw("client_ip") {
                 Ok(Some(mut ip_client)) => {
                     if let Some(ip) = ip_client.next() {
-                        client_ip = ip.to_str().unwrap();
+                        init_client_ip(String::from(ip.to_str().unwrap()));
                     }
                 }
                 Ok(None) => {
@@ -1062,12 +1113,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match arguments.try_get_raw("ip") {
             Ok(ip_option) => {
-                let ip = ip_option.unwrap().next().unwrap().to_str().unwrap();
-                if valid_ip(ip) || ip == "localhost" {
+                init_ip(String::from(
+                    ip_option.unwrap().next().unwrap().to_str().unwrap(),
+                ));
+                let ip = get_ip();
+                if valid_ip(ip.clone()) || ip.clone() == String::from("localhost") {
+                    let ip = ip.parse().expect("Invalid IP address format");
                     if is_server() {
                         networked(ip, None);
                     } else {
-                        networked(ip, Some(client_ip));
+                        networked(ip, Some(get_client_ip()));
                     }
                 } else {
                     println!("Please enter a valid ip address.");

@@ -1,9 +1,10 @@
+extern crate advapi32;
 extern crate aes;
 extern crate base32;
 extern crate clap;
 extern crate ctrlc;
 extern crate hex;
-extern crate hkdf; //adjust statefull firewalls OFF.
+extern crate hkdf;
 extern crate hmac;
 extern crate libc;
 extern crate lopdf;
@@ -13,6 +14,7 @@ extern crate rand;
 extern crate sha2;
 extern crate time;
 extern crate tun;
+extern crate winapi;
 
 use aes::cipher::{typenum, Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::*;
@@ -20,26 +22,30 @@ use base32::Alphabet;
 use clap::{Arg, ArgAction};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use pnet::packet::ip::IpNextHeaderProtocols::Ipv4 as Ipv4Protocol;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
-
+use pnet::transport;
 use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
-use std::thread;
+use time::OffsetDateTime;
+use transport::TransportChannelType::Layer3;
+use tun::platform::Device as Tun_Device;
+use tun::Device;
+use IpAddr::V4;
 
 use std::borrow::{Borrow, BorrowMut};
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
+
 use std::net::{IpAddr, Ipv4Addr};
 use std::panic;
 use std::process;
 use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
-use time::OffsetDateTime;
-use tun::platform::Device as Tun_Device;
-use tun::Device; // Import the Device trait
+use std::thread;
 
 // Set the page size to Letter (210.0 x 297.0 mm)
 const MARGIN: f64 = 2.4; // Margin in mm DEFAULT:2.4 for whole page.
@@ -67,10 +73,56 @@ static mut CLIENT_IP: String = String::new();
 static mut IP: String = String::new();
 static mut TUN_NAME: String = String::new();
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 fn is_elevated() -> bool {
     // Check if the user ID is 0 (root)
     unsafe { libc::getuid() == 0 }
+}
+
+#[cfg(target_family = "windows")]
+pub fn is_elevated() -> bool {
+    use winapi::shared::minwindef::{DWORD, LPVOID};
+    use winapi::shared::ntdef::HANDLE;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+    use winapi::um::securitybaseapi::GetTokenInformation;
+    use winapi::um::winnt::{TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+
+    let mut token_handle: HANDLE = std::ptr::null_mut();
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            &mut token_handle as *mut HANDLE,
+        )
+    } == 0
+    {
+        return false;
+    }
+
+    let mut token_info: TOKEN_ELEVATION = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut token_info_size: DWORD = std::mem::size_of::<TOKEN_ELEVATION>() as DWORD;
+    if unsafe {
+        GetTokenInformation(
+            token_handle,
+            TokenElevation,
+            &mut token_info as *mut TOKEN_ELEVATION as LPVOID,
+            token_info_size,
+            &mut token_info_size,
+        )
+    } == 0
+    {
+        unsafe {
+            CloseHandle(token_handle);
+        }
+        return false;
+    }
+
+    unsafe {
+        CloseHandle(token_handle);
+    }
+
+    token_info.TokenIsElevated != 0
 }
 
 fn init_secret(secret: String) {
@@ -379,6 +431,11 @@ fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, datagram); //KEEP THAT LINE TRUE!
 
+    println!(
+        "SEND - packet (Length): {:?}",
+        new_packet.get_total_length()
+    );
+
     Ipv4Packet::owned(new_packet.packet().to_vec()).unwrap()
 }
 
@@ -416,6 +473,11 @@ fn receive(packet: Ipv4Packet) -> Ipv4Packet {
 
     // Replace the old payload with the new one
     set_ipv4_payload(&mut new_packet, base64.as_bytes()); //KEEP THAT LINE TRUE!
+
+    println!(
+        "RECEIVE - packet (Length): {:?}",
+        new_packet.get_total_length()
+    );
 
     Ipv4Packet::owned(new_packet.packet().to_vec()).unwrap()
 }
@@ -731,12 +793,13 @@ fn valid_ip(ip: String) -> bool {
     };
 }
 
+#[cfg(target_os = "linux")]
 fn get_available_subnet() -> Option<String> {
     // Define the non-routable zones
     let non_routable_zones = [
-        ("10.0.0.0/8", "10.0.0.1", "255.255.255.252"),
-        ("172.16.0.0/12", "172.16.0.1", "255.255.255.252"),
-        ("192.168.0.0/16", "192.168.0.1", "255.255.255.252"),
+        ("10.0.0.0/8", "10.0.0.1", "255.255.255.0"),
+        ("172.16.0.0/12", "172.16.0.1", "255.255.255.0"),
+        ("192.168.0.0/16", "192.168.0.1", "255.255.255.0"),
     ];
 
     // Get a list of network interfaces and their IP addresses
@@ -766,7 +829,7 @@ fn get_available_subnet() -> Option<String> {
             let mut dev = "";
             for line in lines.iter() {
                 if line.contains("inet") && !line.contains("inet6") {
-                    //IPV4 only
+                    // IPV4 only
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     dev = *parts.last().unwrap();
                     let existing_ip_addr = parts[1].split('/').next().unwrap();
@@ -791,6 +854,100 @@ fn get_available_subnet() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn get_available_subnet() -> Option<String> {
+    // Define the non-routable zones
+    let non_routable_zones = [
+        ("10.0.0.0/8", "10.0.0.1", "255.255.255.0"),
+        ("172.16.0.0/12", "172.16.0.1", "255.255.255.0"),
+        ("192.168.0.0/16", "192.168.0.1", "255.255.255.0"),
+    ];
+
+    // Get a list of network interfaces and their IP addresses
+    let output = Command::new("ipconfig")
+        .output()
+        .expect("Failed to execute ipconfig command");
+
+    let output_str = String::from_utf8(output.stdout).expect("Failed to convert output to string");
+    let lines: Vec<&str> = output_str.lines().collect();
+
+    // Iterate through the non-routable zones and find the first available subnet
+    for (_zone, address, netmask) in non_routable_zones.iter() {
+        // Parse the zone's IP address
+        let zone_ip = address
+            .split('.')
+            .map(|x| x.parse::<u8>().unwrap())
+            .collect::<Vec<u8>>();
+
+        // Check every possible IP in the subnet
+        for i in 1..=255 {
+            let ip = [zone_ip[0], zone_ip[1], zone_ip[2], i];
+
+            // Check if the IP is already in use
+            let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+            let mut ip_in_use = false;
+            let mut dev = "";
+            for line in lines.iter() {
+                if line.contains("IPv4 Address") {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    dev = "unknown"; // Windows does not provide the device name in ipconfig output
+                    let existing_ip_addr = parts[1].trim();
+                    let existing_ip_addr = existing_ip_addr.parse::<Ipv4Addr>().unwrap();
+                    if existing_ip_addr == ip_addr {
+                        ip_in_use = true;
+                        break;
+                    }
+                }
+            }
+
+            // If the IP is not in use, return it
+            if !ip_in_use {
+                return Some(format!(
+                    "{}.{}.{}.{} {} {} {}.{}.{}.0/24",
+                    ip[0], ip[1], ip[2], ip[3], netmask, dev, ip[0], ip[1], ip[2]
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn get_available_tun_name() -> String {
+    let mut name = "tun0".to_string();
+    let mut index = 0;
+
+    loop {
+        // Check if the TUN device is already in use
+        let output = Command::new("netsh")
+            .arg("interface")
+            .arg("show")
+            .arg("interface")
+            .output();
+
+        match output {
+            Ok(output) => {
+                // Convert the output to a string
+                let stdout = String::from_utf8(output.stdout).unwrap_or_default();
+                // Check if the output contains the TUN device name
+                if stdout.contains(&name) {
+                    // TUN device is in use, try the next name
+                    index += 1;
+                    name = format!("tun{}", index);
+                } else {
+                    // TUN device is not in use, return the name
+                    return name;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to execute command: {}", e);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn get_available_tun_name() -> String {
     let mut name = "tun0".to_string();
     let mut index = 0;
@@ -832,6 +989,7 @@ fn print_error(tun_name: String, error: std::io::Error) {
     eprintln!("Failed to write to tun device {}: {}", tun_name, error);
 }
 
+#[cfg(target_os = "linux")]
 fn set_route(routable: &str, dev: &str) {
     let _output = Command::new("ip")
         .arg("route")
@@ -843,6 +1001,19 @@ fn set_route(routable: &str, dev: &str) {
         .expect("Failed to add route for tun interface");
 }
 
+#[cfg(target_os = "windows")]
+fn set_route(routable: &str, dev: &str) {
+    let _output = Command::new("route")
+        .arg("add")
+        .arg(routable)
+        .arg("mask")
+        .arg("255.255.255.0") // Adjust the subnet mask as needed
+        .arg(dev)
+        .output()
+        .expect("Failed to add route for tun interface");
+}
+
+#[cfg(target_os = "linux")]
 fn del_route(routable: &str, dev: &str) {
     let _output = Command::new("ip")
         .arg("route")
@@ -854,10 +1025,21 @@ fn del_route(routable: &str, dev: &str) {
         .expect("Failed to remove route for tun interface");
 }
 
-/*
+#[cfg(target_os = "windows")]
+fn del_route(routable: &str, dev: &str) {
+    let _output = Command::new("route")
+        .arg("delete")
+        .arg(routable)
+        .arg("mask")
+        .arg("255.255.255.0") // Adjust the subnet mask as needed
+        .arg(dev)
+        .output()
+        .expect("Failed to remove route for tun interface");
+}
+
 fn push_packet(packet: Ipv4Packet) {
     // Create a transport sender
-    let (mut sender, _) = transport::transport_channel(1500, Layer3(Ipv4)).unwrap();
+    let (mut sender, _) = transport::transport_channel(1500, Layer3(Ipv4Protocol)).unwrap();
 
     // Extract the destination before moving the packet
     let destination = packet.get_destination();
@@ -865,7 +1047,7 @@ fn push_packet(packet: Ipv4Packet) {
     // Send the packet
     let _ = sender.send_to(packet, V4(destination));
 }
-
+/*
 fn push_stdout(packet: Ipv4Packet) {
     use std::io::{self, BufWriter, Write};
 
@@ -921,9 +1103,8 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
         }
 
         // Create the TUN device and enable the TUN device
-
         let dev = Arc::new(Mutex::new(Tun_Device::new(&config).unwrap()));
-        let _ = dev.lock().unwrap().enabled(true);
+        //let _ = dev.lock().unwrap().enabled(true);
         //let dev_enabled = Arc::clone(&dev);
         if !is_server() {
             println!(
@@ -982,19 +1163,19 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                                                         dst_ip.to_string()
                                                     );
                                                     let decoded_packet = receive(packet);
-                                                    //push_packet(decoded_packet)
+                                                    push_packet(decoded_packet);
                                                     //push_stdout(decoded_packet);
-                                                    if let Err(e) =
-                                                        queue.write(decoded_packet.packet())
-                                                    {
-                                                        print_error(get_tun_name(), e);
-                                                        // Use the cloned tun_name variable
-                                                    }
-                                                    let _ = queue.flush();
+                                                    //if let Err(e) =
+                                                    //    queue.write(decoded_packet.packet())
+                                                    //{
+                                                    //    print_error(get_tun_name(), e);
+                                                    // Use the cloned tun_name variable
+                                                    //}
+                                                    //let _ = queue.flush();
                                                 } else {
                                                     //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
                                                     println!(
-                                                        "Sending Packet..{}-->(forged){:#?}",
+                                                        "Sending Packet..{}-->(forged)-->{:#?}",
                                                         src_ip.to_string(),
                                                         ip
                                                     );

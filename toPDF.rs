@@ -1,7 +1,7 @@
-extern crate advapi32;
+// Title: toPDF v0.0.1
 extern crate aes;
 extern crate base32;
-extern crate clap;
+extern crate clap; //TODO: fix accepting the packet out of the mangle chain.
 extern crate ctrlc; //TODO: Fix the receive in networked.
 extern crate hex;
 extern crate hkdf;
@@ -15,7 +15,6 @@ extern crate rand;
 extern crate sha2;
 extern crate time;
 extern crate tun;
-extern crate winapi;
 
 use aes::cipher::{typenum, Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::*;
@@ -30,6 +29,7 @@ use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
 use std::ffi::CStr;
+use std::mem;
 use std::process::{exit, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
@@ -37,6 +37,7 @@ use tun::platform::Queue;
 use tun::Device;
 
 use std::borrow::{Borrow, BorrowMut};
+use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
@@ -45,7 +46,10 @@ use std::panic;
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
-use nftnl_sys::libc::{recvfrom, sendto, sockaddr, sockaddr_ll, socket, AF_PACKET, SOCK_RAW};
+use nftnl_sys::libc::{
+    bind, close, recv, recvfrom, send, sendto, sockaddr, sockaddr_ll, sockaddr_nl, socket,
+    AF_PACKET, NLMSG_ERROR, NLMSG_NOOP, SOCK_RAW,
+};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::ptr;
@@ -57,6 +61,7 @@ const INITIAL_PAGE_WIDTH: Mm = Mm(210.0);
 const INITIAL_PAGE_HEIGHT: Mm = Mm(80.0); // DEFAULT:297.0
 const EMPTY_LINE_WIDTH: f64 = 210.0;
 const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
+const NLMSG_ACK: u16 = 0; // Define the NLMSG_ACK constant
 
 static INIT: Once = Once::new();
 static INIT2: Once = Once::new();
@@ -190,6 +195,94 @@ fn get_tun_name() -> String {
     }
 }
 
+fn flush_nftables() -> Result<(), io::Error> {
+    // Execute the nft command to flush the ruleset
+    let output = Command::new("nft").args(&["flush", "ruleset"]).output()?;
+
+    // Check if the command was successful
+    if output.status.success() {
+        println!("Successfully flushed nftables rules");
+        Ok(())
+    } else {
+        // If there was an error, print the error message
+        let error_message = String::from_utf8_lossy(&output.stderr);
+        eprintln!("Failed to flush nftables rules: {}", error_message);
+        Err(io::Error::new(io::ErrorKind::Other, error_message))
+    }
+}
+
+/// Function to find the first network interface that is "up"
+fn get_first_up_interface() -> Result<Option<String>, Box<dyn Error>> {
+    // Run the `ip addr` command and capture the output
+    let output = Command::new("ip").arg("addr").output()?;
+
+    // Check if the command was successful
+    if !output.status.success() {
+        return Err("Failed to execute ip addr command".into());
+    }
+
+    // Parse the output as a UTF-8 string
+    let output_str = std::str::from_utf8(&output.stdout)?;
+
+    // Split the output into lines and process them
+    let mut current_interface: Option<&str> = None;
+
+    for line in output_str.lines() {
+        // Look for lines that represent a network interface (they start with a number followed by the interface name)
+        if line.contains(": <") {
+            // Get the name of the interface (extract part before the colon)
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(iface_name) = parts.get(1) {
+                current_interface = Some(iface_name.trim_end_matches(':'));
+            }
+        }
+
+        // Look for the UP flag
+        if line.contains("state UP") && current_interface.is_some() {
+            return Ok(Some(current_interface.unwrap().to_string()));
+        }
+    }
+
+    // If no interface is found, return None
+    Ok(None)
+}
+
+/// Function to find the IP address of a given interface
+fn get_ip_of_interface(interface: &str) -> Result<Option<String>, Box<dyn Error>> {
+    // Run the `ip addr` command and capture the output
+    let output = Command::new("ip").arg("addr").output()?;
+
+    // Check if the command was successful
+    if !output.status.success() {
+        return Err("Failed to execute ip addr command".into());
+    }
+
+    // Parse the output as a UTF-8 string
+    let output_str = std::str::from_utf8(&output.stdout)?;
+
+    let mut is_target_interface = false;
+
+    for line in output_str.lines() {
+        // Check if this line refers to the target interface
+        if line.contains(&format!("{}:", interface)) {
+            is_target_interface = true;
+        }
+
+        // If we are at the target interface and find an IP address, return it
+        if is_target_interface && line.contains("inet ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(ip_with_mask) = parts.get(1) {
+                // Split the IP and the mask, returning just the IP part
+                let ip = ip_with_mask.split('/').next().unwrap_or("");
+                return Ok(Some(ip.to_string()));
+            }
+        }
+    }
+
+    // If no IP is found, return None
+    Ok(None)
+}
+
 pub struct Trace {
     trace: *mut nftnl_trace,
 }
@@ -227,20 +320,123 @@ impl Trace {
     }
 }
 
-fn flush_nftables() {
-    let output = Command::new("nft")
-        .args(&["flush", "ruleset"])
-        .output()
-        .expect("Failed to execute nft command");
+// Align the length to the nearest multiple of 4
+fn nlmsg_align(len: usize) -> usize {
+    (len + 3) & !3
+}
 
-    if output.status.success() {
-        println!("Successfully flushed nftables rules");
-    } else {
+const AF_NETLINK: i32 = 16; // Address family for netlink
+const NETLINK_NETFILTER: i32 = 12; // Netlink protocol for netfilter
+
+// Struct for Netlink message
+#[repr(C)]
+#[derive(Debug)]
+struct Nlmsghdr {
+    nlmsg_len: u32,
+    nlmsg_type: u16,
+    nlmsg_flags: u16,
+    nlmsg_seq: u32,
+    nlmsg_pid: u32,
+}
+
+fn process_nfqueue_packets(
+    dev: Arc<Mutex<dyn tun::Device<Queue = Queue>>>,
+    running: Arc<AtomicBool>,
+    queue_index: usize,
+) {
+    // Create a netlink socket
+    let sock_fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
+
+    if sock_fd < 0 {
         eprintln!(
-            "Failed to flush nftables rules: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "Failed to create netlink socket: {}",
+            std::io::Error::last_os_error()
         );
+        return;
     }
+
+    // Prepare sockaddr_nl structure
+    let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
+    addr.nl_family = AF_NETLINK as u16;
+    addr.nl_pid = 0; // Kernel
+    addr.nl_groups = 1 << queue_index; // Queue index
+
+    // Bind the socket
+    let ret = unsafe {
+        bind(
+            sock_fd,
+            &addr as *const sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<sockaddr_nl>() as u32,
+        )
+    };
+    if ret < 0 {
+        eprintln!(
+            "Failed to bind netlink socket: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { close(sock_fd) }; // Close socket on error
+        return;
+    }
+
+    let mut buffer: [u8; 4096] = unsafe { mem::zeroed() };
+
+    while running.load(Ordering::SeqCst) {
+        let recv_len =
+            unsafe { recv(sock_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
+
+        if recv_len < 0 {
+            eprintln!(
+                "Failed to receive message: {}",
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+
+        let msg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
+        if msg.nlmsg_type == NLMSG_NOOP as u16 {
+            // Skip noop messages
+            continue;
+        } else if msg.nlmsg_type == NLMSG_ERROR as u16 {
+            eprintln!("Received error message");
+            continue;
+        }
+
+        // Process received packet
+        let packet_data = &buffer[nlmsg_align(mem::size_of::<Nlmsghdr>())..recv_len as usize];
+
+        // Forward to TUN interface
+        if let Err(e) = dev.lock().unwrap().write(packet_data) {
+            eprintln!("Failed to write to TUN device: {}", e);
+        }
+
+        // Send acknowledgment back to the kernel
+        let packet_len = recv_len as usize;
+
+        // Create a new message header for the acknowledgment
+        let mut msg_ack: Nlmsghdr = unsafe { mem::zeroed() };
+        msg_ack.nlmsg_type = NLMSG_ACK; // Set message type to ACK
+        msg_ack.nlmsg_len = (mem::size_of::<Nlmsghdr>() + packet_len) as u32;
+
+        // Send the acknowledgment back to the kernel
+        let send_result = unsafe {
+            send(
+                sock_fd,
+                &msg_ack as *const _ as *const c_void,
+                msg_ack.nlmsg_len as usize,
+                0,
+            )
+        };
+
+        // Check if send operation was successful
+        if send_result == -1 {
+            eprintln!(
+                "Failed to send acknowledgment: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    unsafe { close(sock_fd) }; // Close socket when done
 }
 
 fn hkdf_derive_key(initial_key: u64) -> u64 {
@@ -394,7 +590,7 @@ fn set_ipv4_payload(packet: &mut MutableIpv4Packet, payload: &[u8]) {
     packet.set_checksum(checksum);
 }
 
-fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
+fn send_packet(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     // takes the machine's request encrypt & zlib processes it into a PDF file for transport.
     let mut base64 = String::new();
 
@@ -448,7 +644,7 @@ fn send(packet: Ipv4Packet, forged_dst_ip: Ipv4Addr) -> Ipv4Packet {
     Ipv4Packet::owned(new_packet.packet().to_vec()).unwrap()
 }
 
-fn receive(packet: Ipv4Packet) -> Ipv4Packet {
+fn receive_packet(packet: Ipv4Packet) -> Ipv4Packet {
     // process a request from the far-end tun device into a request processed either near or far depending on the request's origin.
     let mut base64 = String::new();
 
@@ -803,6 +999,11 @@ fn valid_ip(ip: String) -> bool {
 }
 
 fn get_available_subnet() -> Option<String> {
+    let tun_name = get_tun_name();
+    let dev: &str = tun_name.borrow();
+    let first_if_up = get_first_up_interface().unwrap().unwrap();
+    let check_ip = get_ip_of_interface(&first_if_up).unwrap().unwrap();
+    let check_ip = check_ip.parse::<Ipv4Addr>().unwrap();
     // Define the non-routable zones
     let non_routable_zones = [
         ("10.0.0.0/8", "10.1.1.1", "255.255.255.255"),
@@ -834,12 +1035,22 @@ fn get_available_subnet() -> Option<String> {
             // Check if the IP is already in use
             let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
             let mut ip_in_use = false;
-            let mut dev = "";
+
+            let mut ifname = "";
             for line in lines.iter() {
                 if line.contains("inet") && !line.contains("inet6") {
                     // IPV4 only
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    dev = *parts.last().unwrap();
+                    if check_ip
+                        == parts[1]
+                            .split('/')
+                            .next()
+                            .unwrap()
+                            .parse::<Ipv4Addr>()
+                            .unwrap()
+                    {
+                        ifname = parts.last().unwrap();
+                    }
                     let existing_ip_addr = parts[1].split('/').next().unwrap();
                     let existing_ip_addr = existing_ip_addr.parse::<Ipv4Addr>().unwrap();
                     if existing_ip_addr == ip_addr {
@@ -852,8 +1063,8 @@ fn get_available_subnet() -> Option<String> {
             // If the IP is not in use, return it
             if !ip_in_use {
                 return Some(format!(
-                    "{}.{}.{}.{} {} {} {}.{}.{}.0/24",
-                    ip[0], ip[1], ip[2], ip[3], netmask, dev, ip[0], ip[1], ip[2]
+                    "{}.{}.{}.{} {} {} {}.{}.{}.0/24 {}",
+                    ip[0], ip[1], ip[2], ip[3], netmask, dev, ip[0], ip[1], ip[2], ifname
                 ));
             }
         }
@@ -927,10 +1138,11 @@ fn del_route(routable: &str, dev: &str) {
 
 fn set_nfqueue_chain(interface: &str) {
     // Construct the iptables command
+    println!("Setting up NFQUEUE chain for interface {}", interface);
     let _output = Command::new("iptables")
         .args(&[
             "-t",
-            "nat",
+            "mangle",
             "-A",
             "POSTROUTING",
             "-o",
@@ -1018,12 +1230,12 @@ fn process_ingress(
 
                         if src_ip != Ipv4Addr::new(0, 0, 0, 0) {
                             if dst_ip == tun_address {
-                                let received_packet = receive(packet);
+                                let received_packet = receive_packet(packet);
                                 if let Err(e) = send_to_raw_socket(received_packet, raw_socket) {
                                     eprintln!("Error sending packet to raw socket: {}", e);
                                 }
                             } else {
-                                let sent_packet = send(packet, peer_ip);
+                                let sent_packet = send_packet(packet, peer_ip);
                                 if let Err(e) = queue.write(sent_packet.packet()) {
                                     print_error(get_tun_name(), e);
                                 }
@@ -1074,9 +1286,10 @@ fn process_egress(
 }
 
 fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
+    init_tun_name(get_available_tun_name());
     let available_subnet = get_available_subnet();
+
     if let Some(subnet) = available_subnet {
-        init_tun_name(get_available_tun_name());
         let mut config = tun::Configuration::default();
         let parts: Vec<&str> = subnet.split_whitespace().collect();
         let netmask: Ipv4Addr = parts[1].parse().expect("Invalid IP address format");
@@ -1086,6 +1299,8 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
             .expect("Invalid IP address format");
         let num_queues = 56;
         let tun_name = get_tun_name();
+
+        // TUN device configuration
         if is_server() {
             config
                 .address(address)
@@ -1099,9 +1314,8 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
         } else {
             let client_ip = client_ip.clone().unwrap();
             let client_ip: Ipv4Addr = client_ip.parse().expect("Invalid IP address format");
-            let address = client_ip;
             config
-                .address(address)
+                .address(client_ip)
                 .netmask(netmask)
                 .mtu(1500)
                 .name(&tun_name)
@@ -1113,13 +1327,15 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
 
         let ifname = parts[2];
         let routable = parts[3];
+        let originif = parts[4];
         set_route(routable, ifname);
-        set_nfqueue_chain(ifname);
+        set_nfqueue_chain(originif);
         init_iface(ifname.to_string());
         init_routed(routable.to_string());
+
+        // Logging
         if !is_server() {
             println!(
-                //Client Peer Mode.
                 "TUN device created: {} --> local[{}] <--> peer[{}]",
                 &tun_name,
                 client_ip.unwrap(),
@@ -1127,24 +1343,24 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
             );
         } else {
             println!(
-                        "TUN device created: {} --> local[{}] <--> peer[{}]\nDon't forget to use --otp {} on the client within 30 sec.",
-                        &tun_name,
-                        &subnet,
-                        &ip,
-                        get_otp()
-                    );
+                "TUN device created: {} --> local[{}] <--> peer[{}]\nDon't forget to use --otp {} on the client within 30 sec.",
+                &tun_name,
+                &subnet,
+                &ip,
+                get_otp()
+            );
         }
-        // Create the TUN device
-        let dev = Arc::new(Mutex::new(tun::create(&config).unwrap()));
 
+        let dev = Arc::new(Mutex::new(tun::create(&config).unwrap()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Create the raw socket for handling packets
         let raw_socket = unsafe { socket(AF_PACKET, SOCK_RAW, 0x0800) };
         if raw_socket < 0 {
             panic!("Failed to create raw socket");
         }
 
-        let running = Arc::new(AtomicBool::new(true));
-
-        // Set up Ctrl+C signal handler
+        // Ctrl+C signal handler
         {
             let running = Arc::clone(&running);
             ctrlc::set_handler(move || {
@@ -1153,7 +1369,7 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                 unsafe {
                     del_route(ROUTED.borrow(), IFACE.borrow());
                 }
-                flush_nftables(); // Flush nftables on shutdown
+                let _ = flush_nftables(); // Flush nftables on shutdown
                 exit_program(); // Exit immediately after flushing
             })
             .expect("Error setting Ctrl+C handler");
@@ -1162,42 +1378,58 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
         // Custom panic hook for resource cleanup
         std::panic::set_hook(Box::new(|info| {
             eprintln!("Panic occurred: {:?}", info);
-            flush_nftables(); // Flush nftables on panic
-            exit(0);
+            unsafe {
+                del_route(ROUTED.borrow(), IFACE.borrow());
+            }
+            let _ = flush_nftables(); // Flush nftables on shutdown
+            exit_program(); // Exit immediately after flushing
         }));
 
+        // Create handles for threads
         let mut handles = Vec::new();
+        let mut nfqueue_handles = Vec::new();
 
         for i in 0..num_queues {
-            let dev_clone_ingress = Arc::clone(&dev);
-            let running_clone_ingress = Arc::clone(&running);
-            let dev_clone_egress = Arc::clone(&dev);
-            let running_clone_egress = Arc::clone(&running);
+            // Set up the NFQUEUE packet processing
+            let nfqueue_handle = {
+                let dev_clone = Arc::clone(&dev);
+                let running_clone = Arc::clone(&running);
+                thread::spawn(move || {
+                    process_nfqueue_packets(dev_clone, running_clone, i);
+                })
+            };
+            nfqueue_handles.push(nfqueue_handle);
 
             // Ingress thread
-            let ingress_handle = thread::spawn(move || {
-                process_ingress(
-                    running_clone_ingress,
-                    dev_clone_ingress,
-                    raw_socket,
-                    address,
-                    ip,
-                    i,
-                );
-            });
+            let ingress_handle = {
+                let dev_clone = Arc::clone(&dev);
+                let running_clone = Arc::clone(&running);
+                thread::spawn(move || {
+                    process_ingress(running_clone, dev_clone, raw_socket, address, ip, i);
+                })
+            };
 
             // Egress thread
-            let egress_handle = thread::spawn(move || {
-                process_egress(running_clone_egress, dev_clone_egress, raw_socket, i);
-            });
+            let egress_handle = {
+                let dev_clone = Arc::clone(&dev);
+                let running_clone = Arc::clone(&running);
+                thread::spawn(move || {
+                    process_egress(running_clone, dev_clone, raw_socket, i);
+                })
+            };
 
             handles.push(ingress_handle);
             handles.push(egress_handle);
         }
 
-        // Wait for all threads to finish
+        // Wait for all ingress and egress threads to finish
         for handle in handles {
             handle.join().expect("Thread panicked");
+        }
+
+        // Wait for all NFQUEUE threads to finish
+        for handle in nfqueue_handles {
+            handle.join().expect("NFQUEUE thread panicked");
         }
     } else {
         eprintln!("No available subnet found");

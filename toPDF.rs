@@ -61,7 +61,8 @@ const INITIAL_PAGE_WIDTH: Mm = Mm(210.0);
 const INITIAL_PAGE_HEIGHT: Mm = Mm(80.0); // DEFAULT:297.0
 const EMPTY_LINE_WIDTH: f64 = 210.0;
 const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
-const NLMSG_ACK: u16 = 0; // Define the NLMSG_ACK constant
+const NLMSG_ACK: u16 = 0; // Acknowledgment message type
+const NFQA_MANGLE: u16 = 0x0003; // Mangle queue type
 
 static INIT: Once = Once::new();
 static INIT2: Once = Once::new();
@@ -409,20 +410,17 @@ fn process_nfqueue_packets(
             eprintln!("Failed to write to TUN device: {}", e);
         }
 
-        // Send acknowledgment back to the kernel
-        let packet_len = recv_len as usize;
+        // Create a new message header for the NF_ACCEPT verdict
+        let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
+        msg_verdict.nlmsg_type = 3; // 1 is an accept verdict message type in NFQUEUE
+        msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
 
-        // Create a new message header for the acknowledgment
-        let mut msg_ack: Nlmsghdr = unsafe { mem::zeroed() };
-        msg_ack.nlmsg_type = NLMSG_ACK; // Set message type to ACK
-        msg_ack.nlmsg_len = (mem::size_of::<Nlmsghdr>() + packet_len) as u32;
-
-        // Send the acknowledgment back to the kernel
+        // Send the verdict back to the kernel
         let send_result = unsafe {
             send(
                 sock_fd,
-                &msg_ack as *const _ as *const c_void,
-                msg_ack.nlmsg_len as usize,
+                &msg_verdict as *const _ as *const c_void,
+                msg_verdict.nlmsg_len as usize,
                 0,
             )
         };
@@ -430,9 +428,11 @@ fn process_nfqueue_packets(
         // Check if send operation was successful
         if send_result == -1 {
             eprintln!(
-                "Failed to send acknowledgment: {}",
+                "Failed to send verdict: {}",
                 std::io::Error::last_os_error()
             );
+        } else {
+            println!("Successfully sent NF_ACCEPT verdict.");
         }
     }
 
@@ -1142,10 +1142,10 @@ fn set_nfqueue_chain(interface: &str) {
     let _output = Command::new("iptables")
         .args(&[
             "-t",
-            "mangle",
+            "raw",
             "-A",
-            "POSTROUTING",
-            "-o",
+            "PREROUTING",
+            "-i",
             interface,
             "-j",
             "NFQUEUE",

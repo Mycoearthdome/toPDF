@@ -61,8 +61,8 @@ const INITIAL_PAGE_WIDTH: Mm = Mm(210.0);
 const INITIAL_PAGE_HEIGHT: Mm = Mm(80.0); // DEFAULT:297.0
 const EMPTY_LINE_WIDTH: f64 = 210.0;
 const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
-const NLMSG_ACK: u16 = 0; // Acknowledgment message type
-const NFQA_MANGLE: u16 = 0x0003; // Mangle queue type
+                            //const NLMSG_ACK: u16 = 0; // Acknowledgment message type
+                            //const NFQA_MANGLE: u16 = 0x0003; // Mangle queue type
 
 static INIT: Once = Once::new();
 static INIT2: Once = Once::new();
@@ -1142,9 +1142,9 @@ fn set_nfqueue_chain(interface: &str) {
     let _output = Command::new("iptables")
         .args(&[
             "-t",
-            "raw",
+            "filter",
             "-A",
-            "PREROUTING",
+            "FORWARD",
             "-i",
             interface,
             "-j",

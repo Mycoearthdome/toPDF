@@ -2,12 +2,13 @@ extern crate advapi32;
 extern crate aes;
 extern crate base32;
 extern crate clap;
-extern crate ctrlc;
+extern crate ctrlc; //TODO: Fix the receive in networked.
 extern crate hex;
 extern crate hkdf;
 extern crate hmac;
 extern crate libc;
 extern crate lopdf;
+extern crate nftnl_sys;
 extern crate pnet;
 extern crate printpdf;
 extern crate rand;
@@ -22,30 +23,32 @@ use base32::Alphabet;
 use clap::{Arg, ArgAction};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pnet::packet::ip::IpNextHeaderProtocols::Ipv4 as Ipv4Protocol;
+use nftnl_sys::*;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
-use pnet::transport;
 use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
+use std::ffi::CStr;
+use std::process::{exit, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
-use transport::TransportChannelType::Layer3;
-use tun::platform::Device as Tun_Device;
+use tun::platform::Queue;
 use tun::Device;
-use IpAddr::V4;
 
 use std::borrow::{Borrow, BorrowMut};
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::panic;
-use std::process;
-use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
+
+use nftnl_sys::libc::{recvfrom, sendto, sockaddr, sockaddr_ll, socket, AF_PACKET, SOCK_RAW};
+use std::os::raw::c_void;
+use std::os::unix::io::RawFd;
+use std::ptr;
 
 // Set the page size to Letter (210.0 x 297.0 mm)
 const MARGIN: f64 = 2.4; // Margin in mm DEFAULT:2.4 for whole page.
@@ -73,56 +76,9 @@ static mut CLIENT_IP: String = String::new();
 static mut IP: String = String::new();
 static mut TUN_NAME: String = String::new();
 
-#[cfg(target_os = "linux")]
 fn is_elevated() -> bool {
     // Check if the user ID is 0 (root)
     unsafe { libc::getuid() == 0 }
-}
-
-#[cfg(target_family = "windows")]
-pub fn is_elevated() -> bool {
-    use winapi::shared::minwindef::{DWORD, LPVOID};
-    use winapi::shared::ntdef::HANDLE;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
-    use winapi::um::securitybaseapi::GetTokenInformation;
-    use winapi::um::winnt::{TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-
-    let mut token_handle: HANDLE = std::ptr::null_mut();
-    if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY,
-            &mut token_handle as *mut HANDLE,
-        )
-    } == 0
-    {
-        return false;
-    }
-
-    let mut token_info: TOKEN_ELEVATION = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut token_info_size: DWORD = std::mem::size_of::<TOKEN_ELEVATION>() as DWORD;
-    if unsafe {
-        GetTokenInformation(
-            token_handle,
-            TokenElevation,
-            &mut token_info as *mut TOKEN_ELEVATION as LPVOID,
-            token_info_size,
-            &mut token_info_size,
-        )
-    } == 0
-    {
-        unsafe {
-            CloseHandle(token_handle);
-        }
-        return false;
-    }
-
-    unsafe {
-        CloseHandle(token_handle);
-    }
-
-    token_info.TokenIsElevated != 0
 }
 
 fn init_secret(secret: String) {
@@ -231,6 +187,59 @@ fn get_tun_name() -> String {
     unsafe {
         let tun_name = TUN_NAME.clone();
         tun_name
+    }
+}
+
+pub struct Trace {
+    trace: *mut nftnl_trace,
+}
+
+impl Trace {
+    pub fn new() -> Self {
+        unsafe {
+            let trace = nftnl_trace_alloc() as *mut nftnl_trace;
+            if trace.is_null() {
+                panic!("Failed to allocate trace");
+            }
+            Trace { trace }
+        }
+    }
+
+    pub fn free(self) {
+        unsafe {
+            nftnl_trace_free(self.trace);
+        }
+    }
+
+    pub fn is_set(&self, type_: u16) -> bool {
+        unsafe { nftnl_trace_is_set(self.trace, type_) }
+    }
+
+    pub fn get_str(&self, type_: u16) -> Option<String> {
+        unsafe {
+            let c_str = nftnl_trace_get_str(self.trace, type_);
+            if c_str.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(c_str).to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
+fn flush_nftables() {
+    let output = Command::new("nft")
+        .args(&["flush", "ruleset"])
+        .output()
+        .expect("Failed to execute nft command");
+
+    if output.status.success() {
+        println!("Successfully flushed nftables rules");
+    } else {
+        eprintln!(
+            "Failed to flush nftables rules: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -793,13 +802,12 @@ fn valid_ip(ip: String) -> bool {
     };
 }
 
-#[cfg(target_os = "linux")]
 fn get_available_subnet() -> Option<String> {
     // Define the non-routable zones
     let non_routable_zones = [
-        ("10.0.0.0/8", "10.0.0.1", "255.255.255.0"),
-        ("172.16.0.0/12", "172.16.0.1", "255.255.255.0"),
-        ("192.168.0.0/16", "192.168.0.1", "255.255.255.0"),
+        ("10.0.0.0/8", "10.1.1.1", "255.255.255.255"),
+        ("172.16.0.0/12", "172.16.0.1", "255.255.255.255"),
+        ("192.168.0.0/16", "192.168.1.1", "255.255.255.255"),
     ];
 
     // Get a list of network interfaces and their IP addresses
@@ -854,100 +862,6 @@ fn get_available_subnet() -> Option<String> {
     None
 }
 
-#[cfg(target_os = "windows")]
-fn get_available_subnet() -> Option<String> {
-    // Define the non-routable zones
-    let non_routable_zones = [
-        ("10.0.0.0/8", "10.0.0.1", "255.255.255.0"),
-        ("172.16.0.0/12", "172.16.0.1", "255.255.255.0"),
-        ("192.168.0.0/16", "192.168.0.1", "255.255.255.0"),
-    ];
-
-    // Get a list of network interfaces and their IP addresses
-    let output = Command::new("ipconfig")
-        .output()
-        .expect("Failed to execute ipconfig command");
-
-    let output_str = String::from_utf8(output.stdout).expect("Failed to convert output to string");
-    let lines: Vec<&str> = output_str.lines().collect();
-
-    // Iterate through the non-routable zones and find the first available subnet
-    for (_zone, address, netmask) in non_routable_zones.iter() {
-        // Parse the zone's IP address
-        let zone_ip = address
-            .split('.')
-            .map(|x| x.parse::<u8>().unwrap())
-            .collect::<Vec<u8>>();
-
-        // Check every possible IP in the subnet
-        for i in 1..=255 {
-            let ip = [zone_ip[0], zone_ip[1], zone_ip[2], i];
-
-            // Check if the IP is already in use
-            let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
-            let mut ip_in_use = false;
-            let mut dev = "";
-            for line in lines.iter() {
-                if line.contains("IPv4 Address") {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    dev = "unknown"; // Windows does not provide the device name in ipconfig output
-                    let existing_ip_addr = parts[1].trim();
-                    let existing_ip_addr = existing_ip_addr.parse::<Ipv4Addr>().unwrap();
-                    if existing_ip_addr == ip_addr {
-                        ip_in_use = true;
-                        break;
-                    }
-                }
-            }
-
-            // If the IP is not in use, return it
-            if !ip_in_use {
-                return Some(format!(
-                    "{}.{}.{}.{} {} {} {}.{}.{}.0/24",
-                    ip[0], ip[1], ip[2], ip[3], netmask, dev, ip[0], ip[1], ip[2]
-                ));
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn get_available_tun_name() -> String {
-    let mut name = "tun0".to_string();
-    let mut index = 0;
-
-    loop {
-        // Check if the TUN device is already in use
-        let output = Command::new("netsh")
-            .arg("interface")
-            .arg("show")
-            .arg("interface")
-            .output();
-
-        match output {
-            Ok(output) => {
-                // Convert the output to a string
-                let stdout = String::from_utf8(output.stdout).unwrap_or_default();
-                // Check if the output contains the TUN device name
-                if stdout.contains(&name) {
-                    // TUN device is in use, try the next name
-                    index += 1;
-                    name = format!("tun{}", index);
-                } else {
-                    // TUN device is not in use, return the name
-                    return name;
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to execute command: {}", e);
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn get_available_tun_name() -> String {
     let mut name = "tun0".to_string();
     let mut index = 0;
@@ -982,14 +896,13 @@ fn get_available_tun_name() -> String {
 }
 
 fn exit_program() {
-    process::exit(1);
+    exit(1);
 }
 
 fn print_error(tun_name: String, error: std::io::Error) {
     eprintln!("Failed to write to tun device {}: {}", tun_name, error);
 }
 
-#[cfg(target_os = "linux")]
 fn set_route(routable: &str, dev: &str) {
     let _output = Command::new("ip")
         .arg("route")
@@ -1001,19 +914,6 @@ fn set_route(routable: &str, dev: &str) {
         .expect("Failed to add route for tun interface");
 }
 
-#[cfg(target_os = "windows")]
-fn set_route(routable: &str, dev: &str) {
-    let _output = Command::new("route")
-        .arg("add")
-        .arg(routable)
-        .arg("mask")
-        .arg("255.255.255.0") // Adjust the subnet mask as needed
-        .arg(dev)
-        .output()
-        .expect("Failed to add route for tun interface");
-}
-
-#[cfg(target_os = "linux")]
 fn del_route(routable: &str, dev: &str) {
     let _output = Command::new("ip")
         .arg("route")
@@ -1025,44 +925,153 @@ fn del_route(routable: &str, dev: &str) {
         .expect("Failed to remove route for tun interface");
 }
 
-#[cfg(target_os = "windows")]
-fn del_route(routable: &str, dev: &str) {
-    let _output = Command::new("route")
-        .arg("delete")
-        .arg(routable)
-        .arg("mask")
-        .arg("255.255.255.0") // Adjust the subnet mask as needed
-        .arg(dev)
-        .output()
-        .expect("Failed to remove route for tun interface");
+fn set_nfqueue_chain(interface: &str) {
+    // Construct the iptables command
+    let _output = Command::new("iptables")
+        .args(&[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-o",
+            interface,
+            "-j",
+            "NFQUEUE",
+            "--queue-balance",
+            "0:55",
+        ])
+        .output();
 }
 
-fn push_packet(packet: Ipv4Packet) {
-    // Create a transport sender
-    let (mut sender, _) = transport::transport_channel(1500, Layer3(Ipv4Protocol)).unwrap();
+// Function to forward packets from TUN interface to the raw socket
+fn send_to_raw_socket(packet: Ipv4Packet, raw_socket: RawFd) -> Result<(), String> {
+    let dest_addr: sockaddr_ll = sockaddr_ll {
+        sll_family: AF_PACKET as u16,
+        sll_protocol: 0x0800, // ETH_P_IP (IP packet)
+        sll_ifindex: 0,       // Modify based on your setup
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8], // Not used since we're sending directly
+    };
 
-    // Extract the destination before moving the packet
-    let destination = packet.get_destination();
+    // Send the packet via the raw socket
+    let send_len = unsafe {
+        sendto(
+            raw_socket,
+            packet.packet().as_ptr() as *const c_void,
+            packet.packet().len(),
+            0,
+            &dest_addr as *const _ as *const sockaddr,
+            std::mem::size_of::<sockaddr_ll>() as u32,
+        )
+    };
 
-    // Send the packet
-    let _ = sender.send_to(packet, V4(destination));
-}
-/*
-fn push_stdout(packet: Ipv4Packet) {
-    use std::io::{self, BufWriter, Write};
-
-    let stdout = io::stdout();
-
-    let mut buf_writer = BufWriter::new(stdout.lock());
-    if let Err(err) = buf_writer.write_all(packet.payload()) {
-        eprintln!("Failed to write to stdout: {}", err);
+    if send_len < 0 {
+        return Err("Failed to send packet through raw socket".to_string());
     }
-    if let Err(err) = buf_writer.flush() {
-        eprintln!("Failed to flush stdout: {}", err);
-    }
-    let _ = buf_writer.flush();
+
+    Ok(())
 }
-*/
+
+fn send_to_tun_interface(
+    buffer: &[u8],
+    tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
+    queue_index: usize,
+) -> Result<(), String> {
+    let mut tun_locked = tun.lock().unwrap();
+    let queue = tun_locked.queue(queue_index).unwrap();
+
+    queue
+        .write(buffer)
+        .map_err(|e| format!("Error writing to TUN: {}", e))?;
+    queue
+        .flush()
+        .map_err(|e| format!("Error flushing TUN queue: {}", e))?;
+
+    Ok(())
+}
+
+fn process_ingress(
+    running: Arc<AtomicBool>,
+    tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
+    raw_socket: RawFd,
+    tun_address: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    queue_index: usize,
+) {
+    let mut buffer = [0u8; 1504];
+
+    while running.load(Ordering::SeqCst) {
+        let mut tun_locked = tun.lock().unwrap();
+        let queue = tun_locked.queue(queue_index).unwrap();
+        println!("Queue {} ready", queue_index);
+
+        match queue.read(&mut buffer) {
+            Ok(n) => {
+                let _ = queue.flush();
+
+                if n > 0 {
+                    if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
+                        let dst_ip = packet.get_destination();
+                        let src_ip = packet.get_source();
+
+                        if src_ip != Ipv4Addr::new(0, 0, 0, 0) {
+                            if dst_ip == tun_address {
+                                let received_packet = receive(packet);
+                                if let Err(e) = send_to_raw_socket(received_packet, raw_socket) {
+                                    eprintln!("Error sending packet to raw socket: {}", e);
+                                }
+                            } else {
+                                let sent_packet = send(packet, peer_ip);
+                                if let Err(e) = queue.write(sent_packet.packet()) {
+                                    print_error(get_tun_name(), e);
+                                }
+                                let _ = queue.flush();
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read from queue: {}", e);
+            }
+        }
+    }
+}
+
+fn process_egress(
+    running: Arc<AtomicBool>,
+    tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
+    raw_socket: RawFd,
+    queue_index: usize,
+) {
+    let mut buffer = [0u8; 1504];
+
+    while running.load(Ordering::SeqCst) {
+        let recv_len = unsafe {
+            recvfrom(
+                raw_socket,
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer.len(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+
+        if recv_len > 0 {
+            println!("Received {} bytes from raw socket", recv_len);
+            if let Err(e) =
+                send_to_tun_interface(&buffer[..recv_len as usize], Arc::clone(&tun), queue_index)
+            {
+                eprintln!("Error sending packet to TUN interface: {}", e);
+            }
+        } else {
+            eprintln!("Failed to receive packet from raw socket");
+        }
+    }
+}
 
 fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
     let available_subnet = get_available_subnet();
@@ -1088,7 +1097,7 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                 .broadcast(broadcast)
                 .up();
         } else {
-            let client_ip = client_ip.unwrap();
+            let client_ip = client_ip.clone().unwrap();
             let client_ip: Ipv4Addr = client_ip.parse().expect("Invalid IP address format");
             let address = client_ip;
             config
@@ -1102,16 +1111,18 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                 .up();
         }
 
-        // Create the TUN device and enable the TUN device
-        let dev = Arc::new(Mutex::new(Tun_Device::new(&config).unwrap()));
-        //let _ = dev.lock().unwrap().enabled(true);
-        //let dev_enabled = Arc::clone(&dev);
+        let ifname = parts[2];
+        let routable = parts[3];
+        set_route(routable, ifname);
+        set_nfqueue_chain(ifname);
+        init_iface(ifname.to_string());
+        init_routed(routable.to_string());
         if !is_server() {
             println!(
                 //Client Peer Mode.
                 "TUN device created: {} --> local[{}] <--> peer[{}]",
                 &tun_name,
-                get_client_ip(),
+                client_ip.unwrap(),
                 &ip
             );
         } else {
@@ -1123,109 +1134,77 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                         get_otp()
                     );
         }
-        let ifname = parts[2];
-        let routable = parts[3];
-        set_route(routable, ifname);
-        //if_up(&tun_name);
-        init_iface(ifname.to_string());
-        init_routed(routable.to_string());
-        //
-        // Main loop for packet processing
-        panic::catch_unwind(|| {
-            //let mut buf = [0u8; 1504];
-            loop {
-                // Spawn a thread for each queue
-                let mut threads = Vec::new();
+        // Create the TUN device
+        let dev = Arc::new(Mutex::new(tun::create(&config).unwrap()));
 
-                // Spawn a thread for each queue
-                for i in 0..num_queues {
-                    let tun_clone = Arc::clone(&dev); // Create a shared reference to the dev variable
+        let raw_socket = unsafe { socket(AF_PACKET, SOCK_RAW, 0x0800) };
+        if raw_socket < 0 {
+            panic!("Failed to create raw socket");
+        }
 
-                    let handle = thread::spawn(move || {
-                        let mut buffer = [0u8; 1504]; // MTU + 4 bytes TUN header
-                        if let Some(queue) = tun_clone.lock().unwrap().queue(i) {
-                            // Read data from the tun interface
-                            match queue.read(&mut buffer) {
-                                Ok(n) => {
-                                    let _ = queue.flush();
-                                    println!("Received {} bytes from TUN device", n);
-                                    if n > 0 {
-                                        if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
-                                            let dst_ip = packet.get_destination();
-                                            let src_ip = packet.get_source();
+        let running = Arc::new(AtomicBool::new(true));
 
-                                            if src_ip.to_string() != "0.0.0.0".to_string() {
-                                                if dst_ip == address {
-                                                    // Ingress traffic (from network to TUN interface)
-                                                    println!(
-                                                        "Received Packet..{}-->{}",
-                                                        src_ip.to_string(),
-                                                        dst_ip.to_string()
-                                                    );
-                                                    let decoded_packet = receive(packet);
-                                                    push_packet(decoded_packet);
-                                                    //push_stdout(decoded_packet);
-                                                    //if let Err(e) =
-                                                    //    queue.write(decoded_packet.packet())
-                                                    //{
-                                                    //    print_error(get_tun_name(), e);
-                                                    // Use the cloned tun_name variable
-                                                    //}
-                                                    //let _ = queue.flush();
-                                                } else {
-                                                    //println!("Egress traffic (from machine): Src IP: {}, Dst IP: {}", src_ip, dst_ip);
-                                                    println!(
-                                                        "Sending Packet..{}-->(forged)-->{:#?}",
-                                                        src_ip.to_string(),
-                                                        ip
-                                                    );
-                                                    let sent_packet = send(packet, ip);
-                                                    if let Err(e) =
-                                                        queue.write(sent_packet.packet())
-                                                    {
-                                                        print_error(get_tun_name(), e);
-                                                        // Use the cloned tun_name variable
-                                                    }
-                                                    let _ = queue.flush();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_e) => {}
-                            }
-                        }
-                    });
-                    //println!("Thread {} started", i);
-                    // Store thread handles
-                    threads.push(handle);
+        // Set up Ctrl+C signal handler
+        {
+            let running = Arc::clone(&running);
+            ctrlc::set_handler(move || {
+                println!("Received Ctrl+C, shutting down...");
+                running.store(false, Ordering::SeqCst);
+                unsafe {
+                    del_route(ROUTED.borrow(), IFACE.borrow());
                 }
+                flush_nftables(); // Flush nftables on shutdown
+                exit_program(); // Exit immediately after flushing
+            })
+            .expect("Error setting Ctrl+C handler");
+        }
 
-                // Wait for all threads to finish
-                for handle in threads {
-                    handle.join().expect("Thread panicked");
-                }
-            } // end loop
-        })
-        .unwrap_or_else(|_| {
-            del_route(routable, ifname);
-            exit_program();
-        });
+        // Custom panic hook for resource cleanup
+        std::panic::set_hook(Box::new(|info| {
+            eprintln!("Panic occurred: {:?}", info);
+            flush_nftables(); // Flush nftables on panic
+            exit(0);
+        }));
+
+        let mut handles = Vec::new();
+
+        for i in 0..num_queues {
+            let dev_clone_ingress = Arc::clone(&dev);
+            let running_clone_ingress = Arc::clone(&running);
+            let dev_clone_egress = Arc::clone(&dev);
+            let running_clone_egress = Arc::clone(&running);
+
+            // Ingress thread
+            let ingress_handle = thread::spawn(move || {
+                process_ingress(
+                    running_clone_ingress,
+                    dev_clone_ingress,
+                    raw_socket,
+                    address,
+                    ip,
+                    i,
+                );
+            });
+
+            // Egress thread
+            let egress_handle = thread::spawn(move || {
+                process_egress(running_clone_egress, dev_clone_egress, raw_socket, i);
+            });
+
+            handles.push(ingress_handle);
+            handles.push(egress_handle);
+        }
+
+        // Wait for all threads to finish
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
     } else {
         eprintln!("No available subnet found");
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ctrlc::set_handler(move || {
-        println!("Received SIGINT, exiting...");
-        unsafe {
-            del_route(ROUTED.borrow(), IFACE.borrow());
-        }
-        exit_program()
-    })
-    .expect("Error setting Ctrl-C handler");
-
     let mut base64 = String::new();
     if is_elevated() {
         let switches = clap::Command::new("tunpdf")

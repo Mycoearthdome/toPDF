@@ -340,20 +340,16 @@ struct Nlmsghdr {
     nlmsg_pid: u32,
 }
 
-fn process_nfqueue_packets(
-    dev: Arc<Mutex<dyn tun::Device<Queue = Queue>>>,
-    running: Arc<AtomicBool>,
-    queue_index: usize,
-) {
+fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
     // Create a netlink socket
     let sock_fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
-
+    let packet_data;
     if sock_fd < 0 {
         eprintln!(
             "Failed to create netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        return;
+        return Vec::new();
     }
 
     // Prepare sockaddr_nl structure
@@ -376,67 +372,65 @@ fn process_nfqueue_packets(
             std::io::Error::last_os_error()
         );
         unsafe { close(sock_fd) }; // Close socket on error
-        return;
+        return Vec::new();
     }
 
     let mut buffer: [u8; 4096] = unsafe { mem::zeroed() };
 
-    while running.load(Ordering::SeqCst) {
-        let recv_len =
-            unsafe { recv(sock_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
+    let recv_len = unsafe { recv(sock_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
 
-        if recv_len < 0 {
-            eprintln!(
-                "Failed to receive message: {}",
-                std::io::Error::last_os_error()
-            );
-            continue;
-        }
+    if recv_len < 0 {
+        eprintln!(
+            "Failed to receive message: {}",
+            std::io::Error::last_os_error()
+        );
+        return Vec::new();
+    }
 
-        let msg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
-        if msg.nlmsg_type == NLMSG_NOOP as u16 {
-            // Skip noop messages
-            continue;
-        } else if msg.nlmsg_type == NLMSG_ERROR as u16 {
-            eprintln!("Received error message");
-            continue;
-        }
+    let msg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
+    if msg.nlmsg_type == NLMSG_NOOP as u16 {
+        // Skip noop messages
+        return Vec::new();
+    } else if msg.nlmsg_type == NLMSG_ERROR as u16 {
+        eprintln!("Received error message");
+        return Vec::new();
+    }
 
-        // Process received packet
-        let packet_data = &buffer[nlmsg_align(mem::size_of::<Nlmsghdr>())..recv_len as usize];
+    // Process received packet
+    packet_data = &buffer[nlmsg_align(mem::size_of::<Nlmsghdr>())..recv_len as usize];
 
-        // Forward to TUN interface
-        if let Err(e) = dev.lock().unwrap().write(packet_data) {
-            eprintln!("Failed to write to TUN device: {}", e);
-        }
+    // Forward to TUN interface
+    //if let Err(e) = dev.lock().unwrap().write(packet_data) {
+    //    eprintln!("Failed to write to TUN device: {}", e);
+    //}
 
-        // Create a new message header for the NF_ACCEPT verdict
-        let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
-        msg_verdict.nlmsg_type = 3; // 1 is an accept verdict message type in NFQUEUE
-        msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
+    // Create a new message header for the NF_ACCEPT verdict
+    let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
+    msg_verdict.nlmsg_type = 1; // 1 is an accept verdict message type in NFQUEUE
+    msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
 
-        // Send the verdict back to the kernel
-        let send_result = unsafe {
-            send(
-                sock_fd,
-                &msg_verdict as *const _ as *const c_void,
-                msg_verdict.nlmsg_len as usize,
-                0,
-            )
-        };
+    // Send the verdict back to the kernel
+    let send_result = unsafe {
+        send(
+            sock_fd,
+            &msg_verdict as *const _ as *const c_void,
+            msg_verdict.nlmsg_len as usize,
+            0,
+        )
+    };
 
-        // Check if send operation was successful
-        if send_result == -1 {
-            eprintln!(
-                "Failed to send verdict: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            println!("Successfully sent NF_ACCEPT verdict.");
-        }
+    // Check if send operation was successful
+    if send_result == -1 {
+        eprintln!(
+            "Failed to send verdict: {}",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        println!("Successfully sent NF_ACCEPT verdict.");
     }
 
     unsafe { close(sock_fd) }; // Close socket when done
+    packet_data.to_vec()
 }
 
 fn hkdf_derive_key(initial_key: u64) -> u64 {
@@ -1142,10 +1136,10 @@ fn set_nfqueue_chain(interface: &str) {
     let _output = Command::new("iptables")
         .args(&[
             "-t",
-            "filter",
+            "raw",
             "-A",
-            "FORWARD",
-            "-i",
+            "OUTPUT",
+            "-o",
             interface,
             "-j",
             "NFQUEUE",
@@ -1205,7 +1199,6 @@ fn send_to_tun_interface(
 }
 
 fn process_ingress(
-    running: Arc<AtomicBool>,
     tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
     raw_socket: RawFd,
     tun_address: Ipv4Addr,
@@ -1214,74 +1207,69 @@ fn process_ingress(
 ) {
     let mut buffer = [0u8; 1504];
 
-    while running.load(Ordering::SeqCst) {
-        let mut tun_locked = tun.lock().unwrap();
-        let queue = tun_locked.queue(queue_index).unwrap();
-        println!("Queue {} ready", queue_index);
+    let mut tun_locked = tun.lock().unwrap();
+    let queue = tun_locked.queue(queue_index).unwrap();
+    println!("Queue {} ready", queue_index);
 
-        match queue.read(&mut buffer) {
-            Ok(n) => {
-                let _ = queue.flush();
+    match queue.read(&mut buffer) {
+        Ok(n) => {
+            let _ = queue.flush();
 
-                if n > 0 {
-                    if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
-                        let dst_ip = packet.get_destination();
-                        let src_ip = packet.get_source();
+            if n > 0 {
+                if let Some(packet) = Ipv4Packet::new(&buffer[..n]) {
+                    let dst_ip = packet.get_destination();
+                    let src_ip = packet.get_source();
 
-                        if src_ip != Ipv4Addr::new(0, 0, 0, 0) {
-                            if dst_ip == tun_address {
-                                let received_packet = receive_packet(packet);
-                                if let Err(e) = send_to_raw_socket(received_packet, raw_socket) {
-                                    eprintln!("Error sending packet to raw socket: {}", e);
-                                }
-                            } else {
-                                let sent_packet = send_packet(packet, peer_ip);
-                                if let Err(e) = queue.write(sent_packet.packet()) {
-                                    print_error(get_tun_name(), e);
-                                }
-                                let _ = queue.flush();
+                    if src_ip != Ipv4Addr::new(0, 0, 0, 0) {
+                        if dst_ip == tun_address {
+                            let received_packet = receive_packet(packet);
+                            if let Err(e) = send_to_raw_socket(received_packet, raw_socket) {
+                                eprintln!("Error sending packet to raw socket: {}", e);
                             }
+                        } else {
+                            let sent_packet = send_packet(packet, peer_ip);
+                            if let Err(e) = queue.write(sent_packet.packet()) {
+                                print_error(get_tun_name(), e);
+                            }
+                            let _ = queue.flush();
                         }
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to read from queue: {}", e);
-            }
+        }
+        Err(e) => {
+            eprintln!("Failed to read from queue: {}", e);
         }
     }
 }
 
 fn process_egress(
-    running: Arc<AtomicBool>,
     tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
     raw_socket: RawFd,
     queue_index: usize,
 ) {
     let mut buffer = [0u8; 1504];
 
-    while running.load(Ordering::SeqCst) {
-        let recv_len = unsafe {
-            recvfrom(
-                raw_socket,
-                buffer.as_mut_ptr() as *mut c_void,
-                buffer.len(),
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
+    let recv_len = unsafe {
+        recvfrom(
+            raw_socket,
+            buffer.as_mut_ptr() as *mut c_void,
+            buffer.len(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
 
-        if recv_len > 0 {
-            println!("Received {} bytes from raw socket", recv_len);
-            if let Err(e) =
-                send_to_tun_interface(&buffer[..recv_len as usize], Arc::clone(&tun), queue_index)
-            {
-                eprintln!("Error sending packet to TUN interface: {}", e);
-            }
-        } else {
-            eprintln!("Failed to receive packet from raw socket");
+    if recv_len > 0 {
+        println!("Received {} bytes from raw socket", recv_len);
+        if let Err(e) =
+            send_to_tun_interface(&buffer[..recv_len as usize], Arc::clone(&tun), queue_index)
+        {
+            eprintln!("Error sending packet to TUN interface: {}", e);
         }
+    } else {
+        eprintln!("Failed to receive packet from raw socket");
     }
 }
 
@@ -1354,12 +1342,6 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
         let dev = Arc::new(Mutex::new(tun::create(&config).unwrap()));
         let running = Arc::new(AtomicBool::new(true));
 
-        // Create the raw socket for handling packets
-        let raw_socket = unsafe { socket(AF_PACKET, SOCK_RAW, 0x0800) };
-        if raw_socket < 0 {
-            panic!("Failed to create raw socket");
-        }
-
         // Ctrl+C signal handler
         {
             let running = Arc::clone(&running);
@@ -1384,52 +1366,40 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
             let _ = flush_nftables(); // Flush nftables on shutdown
             exit_program(); // Exit immediately after flushing
         }));
-
-        // Create handles for threads
-        let mut handles = Vec::new();
-        let mut nfqueue_handles = Vec::new();
-
-        for i in 0..num_queues {
-            // Set up the NFQUEUE packet processing
-            let nfqueue_handle = {
+        while running.load(Ordering::SeqCst) {
+            // Create handles for threads
+            let mut nfqueue_handles = Vec::new();
+            for i in 0..num_queues {
+                // Create the raw socket for handling packets
+                let raw_socket = unsafe { socket(AF_PACKET, SOCK_RAW, 0x0800) };
+                if raw_socket < 0 {
+                    panic!("Failed to create raw socket");
+                }
+                // Clone the Arc before moving it into the closure
                 let dev_clone = Arc::clone(&dev);
-                let running_clone = Arc::clone(&running);
-                thread::spawn(move || {
-                    process_nfqueue_packets(dev_clone, running_clone, i);
-                })
-            };
-            nfqueue_handles.push(nfqueue_handle);
+                // Set up the NFQUEUE packet processing
+                let nfqueue_handle = {
+                    thread::spawn(move || {
+                        let packet_data = process_nfqueue_packets(i);
+                        if packet_data.len() > 0 {
+                            let dev_clone_ingress = Arc::clone(&dev_clone);
+                            process_ingress(dev_clone_ingress, raw_socket, address, ip, i);
+                            let dev_clone_egress = Arc::clone(&dev_clone);
+                            process_egress(dev_clone_egress, raw_socket, i);
+                        }
+                    })
+                };
+                // close the raw socket
+                unsafe {
+                    close(raw_socket);
+                }
+                nfqueue_handles.push(nfqueue_handle);
+            }
 
-            // Ingress thread
-            let ingress_handle = {
-                let dev_clone = Arc::clone(&dev);
-                let running_clone = Arc::clone(&running);
-                thread::spawn(move || {
-                    process_ingress(running_clone, dev_clone, raw_socket, address, ip, i);
-                })
-            };
-
-            // Egress thread
-            let egress_handle = {
-                let dev_clone = Arc::clone(&dev);
-                let running_clone = Arc::clone(&running);
-                thread::spawn(move || {
-                    process_egress(running_clone, dev_clone, raw_socket, i);
-                })
-            };
-
-            handles.push(ingress_handle);
-            handles.push(egress_handle);
-        }
-
-        // Wait for all ingress and egress threads to finish
-        for handle in handles {
-            handle.join().expect("Thread panicked");
-        }
-
-        // Wait for all NFQUEUE threads to finish
-        for handle in nfqueue_handles {
-            handle.join().expect("NFQUEUE thread panicked");
+            // Wait for all NFQUEUE threads to finish
+            for handle in nfqueue_handles {
+                handle.join().expect("NFQUEUE thread panicked");
+            }
         }
     } else {
         eprintln!("No available subnet found");

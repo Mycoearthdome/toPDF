@@ -1,8 +1,8 @@
 // Title: toPDF v0.0.1
 extern crate aes;
 extern crate base32;
-extern crate clap; //TODO: fix accepting the packet out of the mangle chain.
-extern crate ctrlc; //TODO: Fix the receive in networked.
+extern crate clap; 
+extern crate ctrlc; 
 extern crate hex;
 extern crate hkdf;
 extern crate hmac;
@@ -47,12 +47,11 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
 use nftnl_sys::libc::{
-    bind, close, recv, recvfrom, send, sendto, sockaddr, sockaddr_ll, sockaddr_nl, socket,
-    AF_PACKET, NLMSG_ERROR, NLMSG_NOOP, SOCK_RAW,
+    bind, close, recv, send, sendto, sockaddr, sockaddr_ll, sockaddr_nl, socket, AF_PACKET,
+    NLMSG_ERROR, NLMSG_NOOP, SOCK_RAW,
 };
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
-use std::ptr;
 
 // Set the page size to Letter (210.0 x 297.0 mm)
 const MARGIN: f64 = 2.4; // Margin in mm DEFAULT:2.4 for whole page.

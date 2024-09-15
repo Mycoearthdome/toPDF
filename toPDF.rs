@@ -29,7 +29,6 @@ use printpdf::*;
 use rand::Rng;
 use sha2::Sha512;
 use std::ffi::CStr;
-use std::mem;
 use std::process::{exit, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
@@ -42,15 +41,14 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::raw;
 use std::panic;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
-use nftnl_sys::libc::{
-    bind, close, recv, send, sendto, sockaddr, sockaddr_ll, sockaddr_nl, socket, AF_PACKET,
-    NLMSG_ERROR, NLMSG_NOOP, SOCK_RAW,
+use libc::{
+    bind, close, recv, send, sendto, sockaddr, sockaddr_ll, sockaddr_nl, socket, AF_NETLINK,
+    AF_PACKET, NETLINK_NETFILTER, NFNL_SUBSYS_QUEUE, NFQNL_MSG_VERDICT, SOCK_RAW,
 };
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
@@ -64,6 +62,9 @@ const EMPTY_LINE_WIDTH: f64 = 210.0;
 const TOP_PAGE: f64 = 80.0; //DEFAULT:297.0 -12.0
                             //const NLMSG_ACK: u16 = 0; // Acknowledgment message type
                             //const NFQA_MANGLE: u16 = 0x0003; // Mangle queue type
+                            //const AF_NETLINK: i32 = 16; // Address family for netlink
+                            //const NETLINK_NETFILTER: i32 = 12; // Netlink protocol for netfilter
+                            //const NETLINK_RAW: i32 = 0;
 
 static INIT: Once = Once::new();
 static INIT2: Once = Once::new();
@@ -346,76 +347,126 @@ impl Trace {
     }
 }
 
-// Align the length to the nearest multiple of 4
-fn nlmsg_align(len: usize) -> usize {
-    (len + 3) & !3
-}
-
-const AF_NETLINK: i32 = 16; // Address family for netlink
-const NETLINK_NETFILTER: i32 = 12; // Netlink protocol for netfilter
-
 // Struct for Netlink message
 #[repr(C)]
-#[derive(Debug)]
 struct Nlmsghdr {
-    nlmsg_len: u32,
-    nlmsg_type: u16,
-    nlmsg_flags: u16,
-    nlmsg_seq: u32,
-    nlmsg_pid: u32,
+    nlmsg_len: u32,   // Length of the message including this header
+    nlmsg_type: u16,  // Type of message
+    nlmsg_flags: u16, // Flags
+    nlmsg_seq: u32,   // Sequence number
+    nlmsg_pid: u32,   // PID of the sending process
 }
 
-fn send_verdict(sock_fd: RawFd, verdict: Verdict) {
-    // Create a new message header for the NF_ACCEPT verdict
-    let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
-    msg_verdict.nlmsg_type = verdict as u16; // Verdict type
-    msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
+#[repr(C)]
+struct NfqnlMsgVerdictHdr {
+    verdict: u32, // The verdict (e.g., NF_ACCEPT, NF_DROP)
+    id: u32,      // The packet ID
+}
 
-    // Send the verdict back to the kernel
-    let send_result = unsafe {
-        send(
-            sock_fd,
-            &msg_verdict as *const _ as *const c_void,
-            msg_verdict.nlmsg_len as usize,
-            0,
-        )
-    };
+#[repr(C)]
+struct NfqnlMsgPacketHdr {
+    packet_id: u32,
+    hw_protocol: u16,
+    hook: u16,
+}
 
-    // Check if send operation was successful
+fn extract_packet_id(buffer: &[u8]) -> Option<u32> {
+    use std::mem;
+
+    // Ensure buffer is large enough to hold Nlmsghdr
+    if buffer.len() < mem::size_of::<Nlmsghdr>() {
+        eprintln!("Buffer is too small to contain a Netlink message header.");
+        return None;
+    }
+
+    // Safely read the Nlmsghdr from the buffer
+    let nlmsg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
+
+    // Ensure the buffer is large enough to hold the full message
+    if (nlmsg.nlmsg_len as usize) > buffer.len()
+        || (nlmsg.nlmsg_len as usize) < mem::size_of::<Nlmsghdr>()
+    {
+        eprintln!("Invalid Netlink message length.");
+        return None;
+    }
+
+    // Calculate where the payload starts
+    let payload_start = mem::size_of::<Nlmsghdr>();
+
+    // Ensure the buffer has enough data for NfqnlMsgPacketHdr
+    if buffer.len() < payload_start + mem::size_of::<NfqnlMsgPacketHdr>() {
+        eprintln!("Buffer is too small to contain the Netfilter Queue packet header.");
+        return None;
+    }
+
+    // Safely read the NfqnlMsgPacketHdr from the payload
+    let nfq_packet_hdr =
+        unsafe { &*(buffer[payload_start..].as_ptr() as *const NfqnlMsgPacketHdr) };
+
+    // Convert the packet_id to host byte order and return it
+    Some(u32::from_be(nfq_packet_hdr.packet_id))
+}
+
+fn send_verdict(sock_fd: RawFd, verdict: Verdict, packet_id: u32) {
+    let mut msg_verdict: Nlmsghdr = unsafe { std::mem::zeroed() };
+    msg_verdict.nlmsg_type = ((NFNL_SUBSYS_QUEUE as u16) << 8) | (NFQNL_MSG_VERDICT as u16);
+    msg_verdict.nlmsg_len =
+        (std::mem::size_of::<Nlmsghdr>() + std::mem::size_of::<NfqnlMsgVerdictHdr>()) as u32;
+
+    // Create the verdict message (including the packet ID and verdict)
+    let mut verdict_msg: NfqnlMsgVerdictHdr = unsafe { std::mem::zeroed() };
+    verdict_msg.verdict = verdict as u32;
+    verdict_msg.id = packet_id.to_be(); // Convert packet ID to network byte order
+
+    // Create a buffer to hold the message header and the verdict
+    let total_size = msg_verdict.nlmsg_len as usize;
+    let mut buffer: Vec<u8> = vec![0; total_size];
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &msg_verdict as *const _ as *const u8,
+            buffer.as_mut_ptr(),
+            std::mem::size_of::<Nlmsghdr>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &verdict_msg as *const _ as *const u8,
+            buffer.as_mut_ptr().add(std::mem::size_of::<Nlmsghdr>()),
+            std::mem::size_of::<NfqnlMsgVerdictHdr>(),
+        );
+    }
+
+    let send_result = unsafe { send(sock_fd, buffer.as_ptr() as *const c_void, total_size, 0) };
+
     if send_result == -1 {
         eprintln!(
             "Failed to send verdict: {}",
             std::io::Error::last_os_error()
         );
     } else {
-        println!("Successfully sent NF_ACCEPT verdict.");
+        println!("Successfully sent verdict.");
     }
 }
 
-fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
-    // Create a netlink socket
-    let sock_fd: raw::c_int = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
-    let packet_data;
+fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, RawFd, Option<u32>) {
+    let sock_fd: RawFd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
     if sock_fd < 0 {
         eprintln!(
             "Failed to create netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        return (Vec::new(), 0);
+        return (Vec::new(), -1, None); // Return -1 for error
     }
 
-    // Prepare sockaddr_nl structure
-    let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
+    let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = AF_NETLINK as u16;
     addr.nl_pid = 0; // Kernel
     addr.nl_groups = 1 << queue_index; // Queue index
 
-    // Bind the socket
     let ret = unsafe {
         bind(
             sock_fd,
             &addr as *const sockaddr_nl as *const libc::sockaddr,
-            mem::size_of::<sockaddr_nl>() as u32,
+            std::mem::size_of::<sockaddr_nl>() as u32,
         )
     };
     if ret < 0 {
@@ -423,11 +474,11 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
             "Failed to bind netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        //unsafe { close(sock_fd) }; // Close socket on error
-        return (Vec::new(), 0);
+        //unsafe { libc::close(sock_fd) };
+        return (Vec::new(), -1, None); // Return -1 for error
     }
 
-    let mut buffer: [u8; 4096] = unsafe { mem::zeroed() };
+    let mut buffer: [u8; 4096] = [0; 4096];
 
     let recv_len = unsafe { recv(sock_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
 
@@ -436,28 +487,20 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
             "Failed to receive message: {}",
             std::io::Error::last_os_error()
         );
-        return (Vec::new(), 0);
+        //unsafe { libc::close(sock_fd) };
+        return (Vec::new(), -1, None); // Return -1 for error
     }
 
-    let msg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
-    if msg.nlmsg_type == NLMSG_NOOP as u16 {
-        // Skip noop messages
-        return (Vec::new(), 0);
-    } else if msg.nlmsg_type == NLMSG_ERROR as u16 {
-        eprintln!("Received error message");
-        return (Vec::new(), 0);
+    if recv_len == 0 {
+        eprintln!("Received 0 bytes, connection may be closed.");
+        return (Vec::new(), sock_fd, None);
     }
 
-    // Process received packet
-    packet_data = &buffer[nlmsg_align(mem::size_of::<Nlmsghdr>())..recv_len as usize];
+    let packet_id = extract_packet_id(&buffer);
 
-    // Forward to TUN interface
-    //if let Err(e) = dev.lock().unwrap().write(packet_data) {
-    //    eprintln!("Failed to write to TUN device: {}", e);
-    //}
+    let packet_data = &buffer[..recv_len as usize];
 
-    //unsafe { close(sock_fd) }; // Close socket when done
-    (packet_data.to_vec(), sock_fd)
+    (packet_data.to_vec(), sock_fd, packet_id)
 }
 
 fn hkdf_derive_key(initial_key: u64) -> u64 {
@@ -1168,6 +1211,8 @@ fn set_nfqueue_chain(interface: &str) {
             "OUTPUT",
             "-o",
             interface,
+            "-p",
+            "ALL",
             "-j",
             "NFQUEUE",
             "--queue-balance",
@@ -1360,17 +1405,25 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>, cleanup_receiver: Arc<Mute
                 let nfqueue_handle = {
                     thread::spawn(move || {
                         let mut stole_packet: bool = false;
-                        let (packet_data, raw_socket) = process_nfqueue_packets(i);
+                        let (packet_data, raw_socket, packet_id_opt) = process_nfqueue_packets(i);
                         let dev_clone_ingress = Arc::clone(&dev_clone);
                         process_tun(dev_clone_ingress, raw_socket, address, ip, i);
                         if packet_data.len() > 0 {
                             let dev_clone_egress = Arc::clone(&dev_clone);
                             process_local(dev_clone_egress, packet_data, i);
-                            send_verdict(raw_socket, Verdict::NfStolen);
+                            if let Some(packet_id) = packet_id_opt {
+                                send_verdict(raw_socket, Verdict::NfStolen, packet_id);
+                            } else {
+                                eprintln!("Failed to extract packet ID.");
+                            }
                             stole_packet = true;
                         }
                         if !stole_packet {
-                            send_verdict(raw_socket, Verdict::NfAccept);
+                            if let Some(packet_id) = packet_id_opt {
+                                send_verdict(raw_socket, Verdict::NfAccept, packet_id);
+                            } else {
+                                eprintln!("Failed to extract packet ID.");
+                            }
                         }
                         // close the raw socket
                         unsafe {

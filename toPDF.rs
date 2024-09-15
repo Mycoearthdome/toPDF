@@ -44,6 +44,7 @@ use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::raw;
 use std::panic;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 
@@ -81,6 +82,30 @@ static mut ROUTED: String = String::new();
 static mut CLIENT_IP: String = String::new();
 static mut IP: String = String::new();
 static mut TUN_NAME: String = String::new();
+
+pub enum Verdict {
+    //NFQUEUE Verdicts
+    NfAccept = 1,
+    NfDrop = 0,
+    NfStolen = 2,
+    NfQueue = 3,
+    NfRepeat = 4,
+    NfStop = 5,
+}
+
+// Shared state for cleanup
+struct SharedState {
+    cleanup_sender: Sender<()>,
+}
+
+// Common cleanup function
+fn cleanup_and_exit() {
+    unsafe {
+        del_route(ROUTED.borrow(), IFACE.borrow());
+    }
+    let _ = flush_nftables(); // Flush nftables on shutdown
+    exit_program(); // Exit immediately after flushing
+}
 
 fn is_elevated() -> bool {
     // Check if the user ID is 0 (root)
@@ -340,9 +365,36 @@ struct Nlmsghdr {
     nlmsg_pid: u32,
 }
 
+fn send_verdict(sock_fd: RawFd, verdict: Verdict) {
+    // Create a new message header for the NF_ACCEPT verdict
+    let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
+    msg_verdict.nlmsg_type = verdict as u16; // Verdict type
+    msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
+
+    // Send the verdict back to the kernel
+    let send_result = unsafe {
+        send(
+            sock_fd,
+            &msg_verdict as *const _ as *const c_void,
+            msg_verdict.nlmsg_len as usize,
+            0,
+        )
+    };
+
+    // Check if send operation was successful
+    if send_result == -1 {
+        eprintln!(
+            "Failed to send verdict: {}",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        println!("Successfully sent NF_ACCEPT verdict.");
+    }
+}
+
 fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
     // Create a netlink socket
-    let sock_fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
+    let sock_fd: raw::c_int = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
     let packet_data;
     if sock_fd < 0 {
         eprintln!(
@@ -371,7 +423,7 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
             "Failed to bind netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        unsafe { close(sock_fd) }; // Close socket on error
+        //unsafe { close(sock_fd) }; // Close socket on error
         return (Vec::new(), 0);
     }
 
@@ -404,32 +456,7 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
     //    eprintln!("Failed to write to TUN device: {}", e);
     //}
 
-    // Create a new message header for the NF_ACCEPT verdict
-    let mut msg_verdict: Nlmsghdr = unsafe { mem::zeroed() };
-    msg_verdict.nlmsg_type = 1; // 1 is an accept verdict message type in NFQUEUE
-    msg_verdict.nlmsg_len = (mem::size_of::<Nlmsghdr>() + mem::size_of::<u32>()) as u32; // Adjusted length
-
-    // Send the verdict back to the kernel
-    let send_result = unsafe {
-        send(
-            sock_fd,
-            &msg_verdict as *const _ as *const c_void,
-            msg_verdict.nlmsg_len as usize,
-            0,
-        )
-    };
-
-    // Check if send operation was successful
-    if send_result == -1 {
-        eprintln!(
-            "Failed to send verdict: {}",
-            std::io::Error::last_os_error()
-        );
-    } else {
-        println!("Successfully sent NF_ACCEPT verdict.");
-    }
-
-    unsafe { close(sock_fd) }; // Close socket when done
+    //unsafe { close(sock_fd) }; // Close socket when done
     (packet_data.to_vec(), sock_fd)
 }
 
@@ -1253,7 +1280,7 @@ fn process_local(
     }
 }
 
-fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
+fn networked(ip: Ipv4Addr, client_ip: Option<String>, cleanup_receiver: Arc<Mutex<Receiver<()>>>) {
     init_tun_name(get_available_tun_name());
     let available_subnet = get_available_subnet();
 
@@ -1322,45 +1349,28 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
         let dev = Arc::new(Mutex::new(tun::create(&config).unwrap()));
         let running = Arc::new(AtomicBool::new(true));
 
-        // Ctrl+C signal handler
-        {
-            let running = Arc::clone(&running);
-            ctrlc::set_handler(move || {
-                println!("Received Ctrl+C, shutting down...");
-                running.store(false, Ordering::SeqCst);
-                unsafe {
-                    del_route(ROUTED.borrow(), IFACE.borrow());
-                }
-                let _ = flush_nftables(); // Flush nftables on shutdown
-                exit_program(); // Exit immediately after flushing
-            })
-            .expect("Error setting Ctrl+C handler");
-        }
-
-        // Custom panic hook for resource cleanup
-        std::panic::set_hook(Box::new(|info| {
-            eprintln!("Panic occurred: {:?}", info);
-            unsafe {
-                del_route(ROUTED.borrow(), IFACE.borrow());
-            }
-            let _ = flush_nftables(); // Flush nftables on shutdown
-            exit_program(); // Exit immediately after flushing
-        }));
         while running.load(Ordering::SeqCst) {
             // Create handles for threads
             let mut nfqueue_handles = Vec::new();
             for i in 0..num_queues {
                 // Clone the Arc before moving it into the closure
                 let dev_clone = Arc::clone(&dev);
+                let cleanup = Arc::clone(&cleanup_receiver);
                 // Set up the NFQUEUE packet processing
                 let nfqueue_handle = {
                     thread::spawn(move || {
+                        let mut stole_packet: bool = false;
                         let (packet_data, raw_socket) = process_nfqueue_packets(i);
                         let dev_clone_ingress = Arc::clone(&dev_clone);
                         process_tun(dev_clone_ingress, raw_socket, address, ip, i);
                         if packet_data.len() > 0 {
                             let dev_clone_egress = Arc::clone(&dev_clone);
                             process_local(dev_clone_egress, packet_data, i);
+                            send_verdict(raw_socket, Verdict::NfStolen);
+                            stole_packet = true;
+                        }
+                        if !stole_packet {
+                            send_verdict(raw_socket, Verdict::NfAccept);
                         }
                         // close the raw socket
                         unsafe {
@@ -1370,6 +1380,10 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                 };
 
                 nfqueue_handles.push(nfqueue_handle);
+                // Check for cleanup signal
+                if cleanup.lock().unwrap().try_recv().is_ok() {
+                    break;
+                }
             }
 
             // Wait for all NFQUEUE threads to finish
@@ -1383,6 +1397,33 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a channel for cleanup notifications
+    let (cleanup_sender, cleanup_receiver) = channel();
+
+    // Wrap the sender in an Arc<Mutex<>> to share it safely across threads
+    let shared_state = Arc::new(Mutex::new(SharedState { cleanup_sender }));
+
+    // Ctrl+C signal handler
+    {
+        let shared_state = Arc::clone(&shared_state);
+        ctrlc::set_handler(move || {
+            println!("Received Ctrl+C, shutting down...");
+            let _ = shared_state.lock().unwrap().cleanup_sender.send(());
+            cleanup_and_exit();
+        })
+        .expect("Error setting Ctrl+C handler");
+    }
+
+    // Custom panic hook for resource cleanup
+    {
+        let shared_state = Arc::clone(&shared_state);
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!("Panic occurred: {:?}", info);
+            let _ = shared_state.lock().unwrap().cleanup_sender.send(());
+            cleanup_and_exit();
+        }));
+    }
+
     let mut base64 = String::new();
     if is_elevated() {
         let switches = clap::Command::new("tunpdf")
@@ -1458,9 +1499,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if valid_ip(ip.clone()) || ip.clone() == String::from("localhost") {
                     let ip = ip.parse().expect("Invalid IP address format");
                     if is_server() {
-                        networked(ip, None);
+                        networked(ip, None, Arc::new(Mutex::new(cleanup_receiver)));
                     } else {
-                        networked(ip, Some(get_client_ip()));
+                        networked(
+                            ip,
+                            Some(get_client_ip()),
+                            Arc::new(Mutex::new(cleanup_receiver)),
+                        );
                     }
                 } else {
                     println!("Please enter a valid ip address.");

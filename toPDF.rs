@@ -1,8 +1,8 @@
 // Title: toPDF v0.0.1
 extern crate aes;
 extern crate base32;
-extern crate clap; 
-extern crate ctrlc; 
+extern crate clap;
+extern crate ctrlc;
 extern crate hex;
 extern crate hkdf;
 extern crate hmac;
@@ -42,6 +42,7 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::raw;
 use std::panic;
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
@@ -339,7 +340,7 @@ struct Nlmsghdr {
     nlmsg_pid: u32,
 }
 
-fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
+fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, raw::c_int) {
     // Create a netlink socket
     let sock_fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER) };
     let packet_data;
@@ -348,7 +349,7 @@ fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
             "Failed to create netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     // Prepare sockaddr_nl structure
@@ -371,7 +372,7 @@ fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
             std::io::Error::last_os_error()
         );
         unsafe { close(sock_fd) }; // Close socket on error
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let mut buffer: [u8; 4096] = unsafe { mem::zeroed() };
@@ -383,16 +384,16 @@ fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
             "Failed to receive message: {}",
             std::io::Error::last_os_error()
         );
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let msg = unsafe { &*(buffer.as_ptr() as *const Nlmsghdr) };
     if msg.nlmsg_type == NLMSG_NOOP as u16 {
         // Skip noop messages
-        return Vec::new();
+        return (Vec::new(), 0);
     } else if msg.nlmsg_type == NLMSG_ERROR as u16 {
         eprintln!("Received error message");
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     // Process received packet
@@ -429,7 +430,7 @@ fn process_nfqueue_packets(queue_index: usize) -> Vec<u8> {
     }
 
     unsafe { close(sock_fd) }; // Close socket when done
-    packet_data.to_vec()
+    (packet_data.to_vec(), sock_fd)
 }
 
 fn hkdf_derive_key(initial_key: u64) -> u64 {
@@ -1349,30 +1350,25 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
             // Create handles for threads
             let mut nfqueue_handles = Vec::new();
             for i in 0..num_queues {
-                // Create the raw socket for handling packets
-                let raw_socket = unsafe { socket(AF_PACKET, SOCK_RAW, 0x0800) };
-                if raw_socket < 0 {
-                    panic!("Failed to create raw socket");
-                }
                 // Clone the Arc before moving it into the closure
                 let dev_clone = Arc::clone(&dev);
                 // Set up the NFQUEUE packet processing
                 let nfqueue_handle = {
                     thread::spawn(move || {
-                        let packet_data = process_nfqueue_packets(i);
-
+                        let (packet_data, raw_socket) = process_nfqueue_packets(i);
                         let dev_clone_ingress = Arc::clone(&dev_clone);
                         process_tun(dev_clone_ingress, raw_socket, address, ip, i);
                         if packet_data.len() > 0 {
                             let dev_clone_egress = Arc::clone(&dev_clone);
                             process_local(dev_clone_egress, packet_data, i);
                         }
+                        // close the raw socket
+                        unsafe {
+                            close(raw_socket);
+                        }
                     })
                 };
-                // close the raw socket
-                unsafe {
-                    close(raw_socket);
-                }
+
                 nfqueue_handles.push(nfqueue_handle);
             }
 

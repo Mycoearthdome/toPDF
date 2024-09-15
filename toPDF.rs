@@ -1181,7 +1181,7 @@ fn send_to_raw_socket(packet: Ipv4Packet, raw_socket: RawFd) -> Result<(), Strin
 }
 
 fn send_to_tun_interface(
-    buffer: &[u8],
+    packet_data: Vec<u8>,
     tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
     queue_index: usize,
 ) -> Result<(), String> {
@@ -1189,7 +1189,7 @@ fn send_to_tun_interface(
     let queue = tun_locked.queue(queue_index).unwrap();
 
     queue
-        .write(buffer)
+        .write(&packet_data)
         .map_err(|e| format!("Error writing to TUN: {}", e))?;
     queue
         .flush()
@@ -1198,7 +1198,7 @@ fn send_to_tun_interface(
     Ok(())
 }
 
-fn process_ingress(
+fn process_tun(
     tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
     raw_socket: RawFd,
     tun_address: Ipv4Addr,
@@ -1243,33 +1243,13 @@ fn process_ingress(
     }
 }
 
-fn process_egress(
+fn process_local(
     tun: Arc<Mutex<dyn Device<Queue = Queue>>>,
-    raw_socket: RawFd,
+    packet_data: Vec<u8>,
     queue_index: usize,
 ) {
-    let mut buffer = [0u8; 1504];
-
-    let recv_len = unsafe {
-        recvfrom(
-            raw_socket,
-            buffer.as_mut_ptr() as *mut c_void,
-            buffer.len(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-
-    if recv_len > 0 {
-        println!("Received {} bytes from raw socket", recv_len);
-        if let Err(e) =
-            send_to_tun_interface(&buffer[..recv_len as usize], Arc::clone(&tun), queue_index)
-        {
-            eprintln!("Error sending packet to TUN interface: {}", e);
-        }
-    } else {
-        eprintln!("Failed to receive packet from raw socket");
+    if let Err(e) = send_to_tun_interface(packet_data, Arc::clone(&tun), queue_index) {
+        eprintln!("Error sending packet to TUN interface: {}", e);
     }
 }
 
@@ -1381,11 +1361,12 @@ fn networked(ip: Ipv4Addr, client_ip: Option<String>) {
                 let nfqueue_handle = {
                     thread::spawn(move || {
                         let packet_data = process_nfqueue_packets(i);
+
+                        let dev_clone_ingress = Arc::clone(&dev_clone);
+                        process_tun(dev_clone_ingress, raw_socket, address, ip, i);
                         if packet_data.len() > 0 {
-                            let dev_clone_ingress = Arc::clone(&dev_clone);
-                            process_ingress(dev_clone_ingress, raw_socket, address, ip, i);
                             let dev_clone_egress = Arc::clone(&dev_clone);
-                            process_egress(dev_clone_egress, raw_socket, i);
+                            process_local(dev_clone_egress, packet_data, i);
                         }
                     })
                 };

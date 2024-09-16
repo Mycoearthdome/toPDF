@@ -9,6 +9,7 @@ extern crate hmac;
 extern crate libc;
 extern crate lopdf;
 extern crate nftnl_sys;
+extern crate nix;
 extern crate pnet;
 extern crate printpdf;
 extern crate rand;
@@ -23,6 +24,7 @@ use clap::{Arg, ArgAction};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use nftnl_sys::*;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
 use printpdf::*;
@@ -220,6 +222,17 @@ fn get_tun_name() -> String {
         let tun_name = TUN_NAME.clone();
         tun_name
     }
+}
+
+fn set_nonblocking(sock_fd: RawFd) -> io::Result<()> {
+    let flags =
+        fcntl(sock_fd, FcntlArg::F_GETFL).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    fcntl(
+        sock_fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    Ok(())
 }
 
 fn flush_nftables() -> Result<(), io::Error> {
@@ -456,11 +469,16 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, RawFd, Option<u32>) 
         );
         return (Vec::new(), -1, None); // Return -1 for error
     }
-
+    let _ = set_nonblocking(sock_fd);
     let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = AF_NETLINK as u16;
     addr.nl_pid = 0; // Kernel
-    addr.nl_groups = 1 << queue_index; // Queue index
+                     //MAYBE >>>>//addr.nl_groups = 1 << queue_index; // Queue index can;t be above 31. (let num_queues = 32; //MAX SIZE u32)
+    let binary_representation = format!("{:b}", queue_index)
+        .parse()
+        .expect("Failed to convert string to u32");
+
+    addr.nl_groups = binary_representation;
 
     let ret = unsafe {
         bind(
@@ -474,25 +492,26 @@ fn process_nfqueue_packets(queue_index: usize) -> (Vec<u8>, RawFd, Option<u32>) 
             "Failed to bind netlink socket: {}",
             std::io::Error::last_os_error()
         );
-        //unsafe { libc::close(sock_fd) };
+        unsafe { libc::close(sock_fd) };
         return (Vec::new(), -1, None); // Return -1 for error
     }
 
     let mut buffer: [u8; 4096] = [0; 4096];
 
     let recv_len = unsafe { recv(sock_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
-
     if recv_len < 0 {
-        eprintln!(
-            "Failed to receive message: {}",
-            std::io::Error::last_os_error()
-        );
-        //unsafe { libc::close(sock_fd) };
+        //eprintln!(
+        //    "Failed to receive message: {} Queue {}",
+        //    std::io::Error::last_os_error(),
+        //    queue_index
+        //);
+        unsafe { libc::close(sock_fd) };
         return (Vec::new(), -1, None); // Return -1 for error
     }
-
+    exit_program(); //HERE
     if recv_len == 0 {
         eprintln!("Received 0 bytes, connection may be closed.");
+        unsafe { libc::close(sock_fd) };
         return (Vec::new(), sock_fd, None);
     }
 
@@ -1201,7 +1220,7 @@ fn del_route(routable: &str, dev: &str) {
 }
 
 fn set_nfqueue_chain(interface: &str) {
-    // Construct the iptables command
+    // Set up iptables rule to intercept packets
     println!("Setting up NFQUEUE chain for interface {}", interface);
     let _output = Command::new("iptables")
         .args(&[
@@ -1218,9 +1237,9 @@ fn set_nfqueue_chain(interface: &str) {
             "--queue-balance",
             "0:55",
         ])
-        .output();
+        .output()
+        .expect("Failed to execute iptables command");
 }
-
 // Function to forward packets from TUN interface to the raw socket
 fn send_to_raw_socket(packet: Ipv4Packet, raw_socket: RawFd) -> Result<(), String> {
     let dest_addr: sockaddr_ll = sockaddr_ll {

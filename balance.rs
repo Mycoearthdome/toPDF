@@ -12,6 +12,7 @@ use std::mem;
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::process::{exit, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -50,8 +51,8 @@ struct NfQueueMsg {
 }
 
 pub enum Verdict {
-    NfAccept = 1,
-    NfDrop = 0,
+    NfAccept = 0, //NFQUEUE = 1
+    NfDrop = 1,   //NFQUEUE = 0
     NfStolen = 2,
     NfQueue = 3,
     NfRepeat = 4,
@@ -87,7 +88,7 @@ fn send_verdict(sock_fd: RawFd, queue_num: u32, packet_id: u32, verdict: u32) ->
         (*payload_ptr).id = packet_id;
         (*payload_ptr).verdict = verdict;
 
-        (*nlmsg).nlmsg_type = (libc::NFNL_SUBSYS_QUEUE as u16) | (queue_num as u16);
+        (*nlmsg).nlmsg_type = (NFTNL_EXPR_QUEUE_NUM as u16) | (queue_num as u16);
 
         let ret = libc::send(sock_fd, nlmsg as *const c_void, nlmsg_size, 0);
         if ret < 0 {
@@ -164,10 +165,15 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
     }
 }
 
-fn handle_queue(stdout: Arc<Mutex<io::Stdout>>, raw_fd: RawFd, queue_id: u32) {
+fn handle_queue(
+    stdout: Arc<Mutex<io::Stdout>>,
+    raw_fd: RawFd,
+    queue_id: u32,
+    running: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; 2048];
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         let size = unsafe { libc::recv(raw_fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
 
         if size < 0 {
@@ -204,15 +210,8 @@ fn handle_queue(stdout: Arc<Mutex<io::Stdout>>, raw_fd: RawFd, queue_id: u32) {
     }
 }
 
-fn create_raw_ip_socket() -> RawFd {
-    let sock_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
-    if sock_fd < 0 {
-        panic!(
-            "Failed to create raw socket: {}",
-            io::Error::last_os_error()
-        );
-    }
-    sock_fd
+fn exit_program() {
+    exit(1);
 }
 
 fn flush_nftables() -> Result<(), io::Error> {
@@ -227,10 +226,6 @@ fn flush_nftables() -> Result<(), io::Error> {
     }
 }
 
-fn exit_program() {
-    exit(1);
-}
-
 fn cleanup(rules: Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>) {
     let _ = flush_nftables();
     unsafe {
@@ -238,6 +233,75 @@ fn cleanup(rules: Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>) {
             nftnl_rule_free(rule.lock().unwrap().get());
         }
     }
+}
+
+fn open_netlink_socket() -> io::Result<RawFd> {
+    let nl_sock =
+        unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_NETFILTER) };
+    if nl_sock < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(nl_sock)
+    }
+}
+
+fn allocate_ruleset(
+    table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
+    chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
+    rules: &mut Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>,
+) {
+    let netlink_socket = open_netlink_socket().expect("Failed to open Netlink socket");
+
+    for queue_num in 0..NFT_RULE_QUEUE_MAX_NUM {
+        let rule = create_rule(&table, &chain, queue_num).expect("Failed to create rule");
+        if rule.is_null() {
+            eprintln!("Failed to create rule");
+            cleanup(rules.clone());
+            exit_program();
+        }
+        rules.push(Arc::new(Mutex::new(SafePtr::new(rule))));
+
+        let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
+
+        unsafe {
+            let nlhdr = nftnl_nlmsg_build_hdr(
+                buffer.as_mut_ptr() as *mut i8,
+                NFTNL_CMD_ADD as u16,
+                NFTNL_RULE_FAMILY as u16,
+                0,
+                queue_num,
+            );
+            nftnl_rule_nlmsg_build_payload(nlhdr, rule);
+
+            send_to_kernel(netlink_socket, &buffer);
+        }
+    }
+}
+
+fn create_raw_ip_socket() -> RawFd {
+    let sock_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if sock_fd < 0 {
+        panic!(
+            "Failed to create raw socket: {}",
+            io::Error::last_os_error()
+        );
+    }
+    sock_fd
+}
+
+fn send_to_kernel(sock: RawFd, buffer: &[u8]) {
+    let ret = unsafe { libc::send(sock, buffer.as_ptr() as *const c_void, buffer.len(), 0) };
+    if ret < 0 {
+        eprintln!(
+            "Error sending Netlink message: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+fn log_error(stdout: &Arc<Mutex<io::Stdout>>, message: &str) {
+    let mut stdout = stdout.lock().unwrap();
+    writeln!(stdout, "ERROR: {}", message).expect("Failed to write to stdout");
 }
 
 fn main() {
@@ -258,36 +322,49 @@ fn main() {
 
     set_nonblocking(*raw_fd.lock().unwrap()).expect("Failed to set socket to non-blocking mode");
 
-    let mut queue_threads = vec![];
-    for queue_num in 0..NFT_RULE_QUEUE_MAX_NUM {
-        let rule = create_rule(&table_arc, &chain_arc, queue_num).expect("Failed to create rule");
-        if rule.is_null() {
-            eprintln!("Failed to create rule");
-            cleanup(rules.lock().unwrap().clone());
-            exit_program();
-        }
-        rules
-            .lock()
-            .unwrap()
-            .push(Arc::new(Mutex::new(SafePtr::new(rule))));
+    allocate_ruleset(&table_arc, &chain_arc, &mut *rules.lock().unwrap());
 
-        let raw_fd = Arc::clone(&raw_fd);
-        let stdout = Arc::clone(&stdout);
-        let queue_thread = thread::spawn(move || {
-            handle_queue(stdout, *raw_fd.lock().unwrap(), queue_num);
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut handles = Vec::new();
+    for queue_id in 0..NFT_RULE_QUEUE_MAX_NUM {
+        let raw_fd_thread = raw_fd.clone();
+        let stdout_clone = stdout.clone();
+        let running = running.clone();
+        let handle = thread::spawn(move || {
+            handle_queue(
+                stdout_clone,
+                *raw_fd_thread.lock().unwrap(),
+                queue_id,
+                running,
+            )
         });
 
-        queue_threads.push(queue_thread);
+        handles.push(handle);
+    }
+    {
+        let running = running.clone();
+        ctrlc::set_handler(move || {
+            println!("Ctrl+C received, cleaning up...");
+            cleanup(rules.lock().unwrap().clone());
+            running.store(false, Ordering::SeqCst);
+            // Free the chain, table, and ruleset safely
+            unsafe {
+                if !chain_arc.lock().unwrap().get().is_null() {
+                    nftnl_chain_free(chain_arc.lock().unwrap().get());
+                }
+
+                if !table_arc.lock().unwrap().get().is_null() {
+                    nftnl_table_free(table_arc.lock().unwrap().get());
+                }
+            }
+            exit_program();
+        })
+        .expect("Error setting Ctrl+C handler");
     }
 
-    ctrlc::set_handler(move || {
-        println!("Ctrl+C received, cleaning up...");
-        cleanup(rules.lock().unwrap().clone());
-        exit_program();
-    })
-    .expect("Error setting Ctrl+C handler");
-
-    for thread in queue_threads {
-        thread.join().expect("Thread failed");
+    // Wait for threads to finish
+    for handle in handles {
+        handle.join().unwrap();
     }
 }

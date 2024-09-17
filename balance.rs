@@ -2,7 +2,7 @@ extern crate ctrlc;
 extern crate nftnl_sys;
 extern crate nix;
 
-use libc::{self, NFPROTO_IPV4};
+use libc::{self, sockaddr_nl, NFPROTO_IPV4};
 use nftnl_sys::*;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::ffi::CString;
@@ -50,9 +50,15 @@ struct NfQueueMsg {
     verdict: u32,
 }
 
+#[repr(C)]
+struct Nla {
+    nla_len: u16,
+    nla_type: u16,
+}
+
 pub enum Verdict {
-    NfAccept = 0, //NFQUEUE = 1
-    NfDrop = 1,   //NFQUEUE = 0
+    NfAccept = 1, //NFQUEUE = 1
+    NfDrop = 0,   //NFQUEUE = 0
     NfStolen = 2,
     NfQueue = 3,
     NfRepeat = 4,
@@ -185,27 +191,41 @@ fn handle_queue(
             continue;
         }
 
-        let size = size as usize;
-        let mut stdout = stdout.lock().unwrap();
-        writeln!(stdout, "Received {} bytes", size).expect("Failed to write to stdout");
+        // Parse Netlink message header
+        let nlmsg = buf.as_ptr() as *const libc::nlmsghdr;
+        let nlmsg_type = unsafe { (*nlmsg).nlmsg_type };
 
-        for byte in &buf[..size] {
-            print!("{:02x} ", byte);
-        }
-        println!();
+        // Check if the message is NFQUEUE related
+        if nlmsg_type == libc::NFNL_SUBSYS_QUEUE as u16 {
+            let size = size as usize;
+            let mut stdout = stdout.lock().unwrap();
+            writeln!(stdout, "Received {} bytes", size).expect("Failed to write to stdout");
 
-        let nfq_packet_header_size =
-            mem::size_of::<libc::nlmsghdr>() + mem::size_of::<NfQueueMsg>();
-        if size >= nfq_packet_header_size {
-            let nfq_msg_ptr = buf.as_ptr() as *const libc::nlmsghdr;
-            let nfq_msg = unsafe { &*(nfq_msg_ptr as *const NfQueueMsg) };
+            for byte in &buf[..size] {
+                print!("{:02x} ", byte);
+            }
+            println!();
 
-            let packet_id = nfq_msg.id;
+            let nfq_packet_header_size =
+                mem::size_of::<libc::nlmsghdr>() + mem::size_of::<NfQueueMsg>();
+            if size >= nfq_packet_header_size {
+                let nfq_msg_ptr = buf.as_ptr() as *const libc::nlmsghdr;
+                let nfq_msg = unsafe { &*(nfq_msg_ptr as *const NfQueueMsg) };
 
-            send_verdict(raw_fd, queue_id, packet_id, Verdict::NfAccept as u32)
-                .expect("Failed to send verdict");
+                let packet_id = nfq_msg.id;
+
+                // Handle the packet (accept it in this case)
+                send_verdict(raw_fd, queue_id, packet_id, Verdict::NfAccept as u32)
+                    .expect("Failed to send verdict");
+            } else {
+                eprintln!("Received message is smaller than expected NFQUEUE packet header size");
+            }
         } else {
-            eprintln!("Received message is smaller than expected NFQUEUE packet header size");
+            // Ignore control messages like NLMSG_DONE or NLMSG_ERROR
+            eprintln!(
+                "Received non-NFQUEUE Netlink message of type: {}",
+                nlmsg_type
+            );
         }
     }
 }
@@ -235,23 +255,12 @@ fn cleanup(rules: Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>) {
     }
 }
 
-fn open_netlink_socket() -> io::Result<RawFd> {
-    let nl_sock =
-        unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_NETFILTER) };
-    if nl_sock < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(nl_sock)
-    }
-}
-
 fn allocate_ruleset(
+    raw_fd: &Arc<Mutex<i32>>,
     table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
     chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
     rules: &mut Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>,
 ) {
-    let netlink_socket = open_netlink_socket().expect("Failed to open Netlink socket");
-
     for queue_num in 0..NFT_RULE_QUEUE_MAX_NUM {
         let rule = create_rule(&table, &chain, queue_num).expect("Failed to create rule");
         if rule.is_null() {
@@ -261,7 +270,7 @@ fn allocate_ruleset(
         }
         rules.push(Arc::new(Mutex::new(SafePtr::new(rule))));
 
-        let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
+        let mut buffer = vec![0u8; 1024]; // Allocate buffer for the Netlink message
 
         unsafe {
             let nlhdr = nftnl_nlmsg_build_hdr(
@@ -273,13 +282,94 @@ fn allocate_ruleset(
             );
             nftnl_rule_nlmsg_build_payload(nlhdr, rule);
 
-            send_to_kernel(netlink_socket, &buffer);
+            send_to_kernel(*raw_fd.lock().unwrap(), &buffer);
         }
     }
 }
 
-fn create_raw_ip_socket() -> RawFd {
-    let sock_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+fn bind_nfqueue_socket(sock_fd: RawFd) -> io::Result<()> {
+    let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    addr.nl_pid = 0;
+    //let binary_representation = format!("{:b}", queue_index)
+    //    .parse()
+    //    .expect("Failed to convert string to u32");
+
+    addr.nl_groups = 0;
+
+    let ret = unsafe {
+        libc::bind(
+            sock_fd,
+            &addr as *const _ as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut msg = libc::nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: libc::NFNL_SUBSYS_QUEUE as u16,
+        nlmsg_flags: 0,
+        nlmsg_seq: 0,
+        nlmsg_pid: 0,
+    };
+
+    let mut attr = Nla {
+        nla_len: 0,
+        nla_type: 0,
+    };
+
+    let mut buf = [0u8; 1024];
+    let mut offset = 0;
+
+    // Set up the NFQUEUE protocol
+    msg.nlmsg_len = mem::size_of::<libc::nlmsghdr>() as u32;
+    msg.nlmsg_type = libc::NFNL_SUBSYS_QUEUE as u16;
+    msg.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16;
+    msg.nlmsg_seq = 0;
+    msg.nlmsg_pid = 0;
+
+    attr.nla_len = mem::size_of::<Nla>() as u16;
+    attr.nla_type = libc::NFQA_CFG_QUEUE_MAXLEN as u16;
+
+    let maxlen = 1024;
+    let attr_data = &mut buf[offset..offset + attr.nla_len as usize];
+    attr_data[0] = (maxlen >> 8) as u8;
+    attr_data[1] = maxlen as u8;
+
+    offset += attr.nla_len as usize;
+
+    attr.nla_len = mem::size_of::<Nla>() as u16;
+    attr.nla_type = libc::NFQA_CFG_FLAGS as u16;
+
+    let flags = libc::NFQA_CFG_F_FAIL_OPEN | libc::NFQA_CFG_F_CONNTRACK;
+    let attr_data = &mut buf[offset..offset + attr.nla_len as usize];
+    attr_data[0] = (flags >> 8) as u8;
+    attr_data[1] = flags as u8;
+
+    //offset += attr.nla_len as usize;
+
+    // Send the message
+    let ret = unsafe {
+        libc::send(
+            sock_fd,
+            &msg as *const _ as *const c_void,
+            msg.nlmsg_len as usize,
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn create_nfqueue_socket() -> RawFd {
+    let sock_fd =
+        unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_NETFILTER) };
     if sock_fd < 0 {
         panic!(
             "Failed to create raw socket: {}",
@@ -299,10 +389,10 @@ fn send_to_kernel(sock: RawFd, buffer: &[u8]) {
     }
 }
 
-fn log_error(stdout: &Arc<Mutex<io::Stdout>>, message: &str) {
-    let mut stdout = stdout.lock().unwrap();
-    writeln!(stdout, "ERROR: {}", message).expect("Failed to write to stdout");
-}
+//fn log_error(stdout: &Arc<Mutex<io::Stdout>>, message: &str) {
+//    let mut stdout = stdout.lock().unwrap();
+//    writeln!(stdout, "ERROR: {}", message).expect("Failed to write to stdout");
+//}
 
 fn main() {
     let stdout = Arc::new(Mutex::new(io::stdout()));
@@ -318,17 +408,18 @@ fn main() {
     let chain_arc = Arc::new(Mutex::new(chain));
     let rules = Arc::new(Mutex::new(Vec::new()));
 
-    let raw_fd = Arc::new(Mutex::new(create_raw_ip_socket()));
+    let raw_fd = Arc::new(Mutex::new(create_nfqueue_socket()));
 
     set_nonblocking(*raw_fd.lock().unwrap()).expect("Failed to set socket to non-blocking mode");
 
-    allocate_ruleset(&table_arc, &chain_arc, &mut *rules.lock().unwrap());
+    allocate_ruleset(&raw_fd, &table_arc, &chain_arc, &mut *rules.lock().unwrap());
 
     let running = Arc::new(AtomicBool::new(true));
 
     let mut handles = Vec::new();
     for queue_id in 0..NFT_RULE_QUEUE_MAX_NUM {
-        let raw_fd_thread = raw_fd.clone();
+        let raw_fd_thread = raw_fd.clone(); //fetching from one raw sockets. Until Bus speed is surpassed by internet speed.
+        let _ = bind_nfqueue_socket(*raw_fd_thread.lock().unwrap());
         let stdout_clone = stdout.clone();
         let running = running.clone();
         let handle = thread::spawn(move || {

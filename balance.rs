@@ -378,7 +378,6 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
         if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
             println!("Table successfully created");
         } else {
-            eprintln!("Failed to create table");
             nftnl_table_free(table);
             libc::close(sock_fd);
             return None;
@@ -457,7 +456,6 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
         if validate_chain_netlink_response(&recv_buffer, recv_len as usize) {
             println!("Chain successfully created");
         } else {
-            eprintln!("Failed to create chain");
             nftnl_chain_free(chain);
             libc::close(sock_fd);
             return None;
@@ -542,7 +540,6 @@ fn create_rule(
         if validate_rule_netlink_response(&recv_buffer, recv_len as usize) {
             println!("Rule successfully created");
         } else {
-            eprintln!("Failed to create rule");
             nftnl_rule_free(rule);
             libc::close(raw_fd);
             return None;
@@ -661,13 +658,14 @@ fn allocate_ruleset(
             continue; // Skip to the next queue if binding fails
         }
 
-        let rule =
-            create_rule(raw_fd_value, &table, &chain, queue_num).expect("Failed to create rule");
-        if rule.is_null() {
-            eprintln!("Failed to create rule for queue {}", queue_num);
-            cleanup(rules.clone());
-            exit_program();
-        }
+        let rule = match create_rule(raw_fd_value, &table, &chain, queue_num) {
+            Some(r) => r,
+            None => {
+                eprintln!("Failed to create rule for queue {}", queue_num);
+                cleanup(rules.clone());
+                exit_program();
+            }
+        };
 
         rules.push(Arc::new(Mutex::new(SafePtr::new(rule))));
     }

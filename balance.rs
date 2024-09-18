@@ -1,11 +1,13 @@
+extern crate crc;
 extern crate ctrlc;
-extern crate netlink;
+
 extern crate nftnl_sys;
 extern crate nix;
 
-use libc::{self, sockaddr_nl, NFPROTO_IPV4};
+use libc::{self, getsockname, sockaddr_nl, socket, NFPROTO_IPV4};
 use nftnl_sys::*;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
 use std::ffi::CString;
 use std::io::{self, Error, ErrorKind, Write};
 use std::marker::PhantomData;
@@ -13,12 +15,14 @@ use std::mem;
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::process::{exit, Command};
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Constants for raw table configuration
-const NFT_TABLE_NAME: &str = "raw";
+const NFT_TABLE_NAME: &str = "raw_packets";
 const NFT_CHAIN_NAME: &str = "output";
 const NFT_RULE_QUEUE_MAX_NUM: u32 = 10;
 const NFT_PROTOCOL_IP: u32 = libc::IPPROTO_IP as u32;
@@ -124,6 +128,168 @@ fn handle_error(err_code: i32) -> &'static str {
         libc::EWOULDBLOCK => "Operation would block (EWOULDBLOCK)",
         libc::EXDEV => "Cross-device link (EXDEV)",
         _ => "Unknown error",
+    }
+}
+
+const NFNL_BUFFSIZE: usize = 4096;
+const NFNL_MAX_SUBSYS: usize = 16;
+const NFNL_F_SEQTRACK_ENABLED: u32 = 1 << 0;
+
+// Define the callback struct (you may need to define this more fully based on your use case)
+#[derive(Default)]
+struct NfnlCallback {
+    // Add relevant fields here for callback data
+}
+
+// Main struct definition
+struct NfnlHandle {
+    fd: RawFd,
+    local: sockaddr_nl,
+    peer: sockaddr_nl,
+    subscriptions: u32,
+    seq: u32,
+    dump: u32,
+    rcv_buffer_size: u32, // for nfnl_catch
+    flags: u32,
+    last_nlhdr: *mut libc::nlmsghdr, // Pointer to the last Netlink message header
+    subsys: [NfnlSubsysHandle; NFNL_MAX_SUBSYS + 1], // Array of subsystem handles
+}
+
+impl Default for NfnlHandle {
+    fn default() -> Self {
+        NfnlHandle {
+            fd: -1,
+            local: unsafe { std::mem::zeroed() },
+            peer: unsafe { std::mem::zeroed() },
+            subscriptions: 0,
+            seq: 0,
+            dump: 0,
+            rcv_buffer_size: NFNL_BUFFSIZE as u32,
+            flags: 0,
+            last_nlhdr: std::ptr::null_mut(),
+            subsys: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct NfnlSubsysHandle {
+    nfnlh: *mut NfnlHandle, // Pointer to nfnl_handle
+    subscriptions: u32,     // Subscriptions bitmask
+    subsys_id: u8,          // Subsystem ID
+    cb_count: u8,           // Number of callbacks
+    cb: *mut NfnlCallback,  // Array of callbacks (represented as a raw pointer)
+}
+
+impl NfnlSubsysHandle {
+    fn new() -> Self {
+        NfnlSubsysHandle {
+            nfnlh: null_mut(), // Initialize pointer to null
+            subscriptions: 0,
+            subsys_id: 0,
+            cb_count: 0,
+            cb: null_mut(), // Initialize callback pointer to null
+        }
+    }
+}
+
+impl NfnlHandle {
+    fn recalc_rebind_subscriptions(&mut self) {
+        let mut new_subscriptions = self.subscriptions;
+
+        // Combine subscriptions from all subsystems
+        for i in 0..NFNL_MAX_SUBSYS {
+            new_subscriptions |= self.subsys[i].subscriptions;
+        }
+
+        // Set the new subscription groups to the local sockaddr_nl
+        self.local.nl_groups = new_subscriptions;
+
+        // Bind the socket with the updated local address
+        let local_addr = 
+            // Create a reference to `sockaddr` using the pointer of `sockaddr_nl`
+            &self.local as *const _ as *const libc::sockaddr;
+
+        let ret = unsafe { 
+            libc::bind(
+                self.fd,
+                local_addr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+
+        if ret == -1 {
+            // Retrieve the error code
+            let errno = unsafe { *libc::__errno_location() };
+            // Convert the error code to an io::Error
+            let err = io::Error::from_raw_os_error(errno);
+            eprintln!("Failed to bind socket on subscription: {}", err);
+        }
+
+        // Update the handle's subscriptions
+        self.subscriptions = new_subscriptions;
+
+    }
+
+    fn new() -> Option<Self> {
+        let mut nfnlh = NfnlHandle::default();
+        unsafe {
+            // Create socket
+            let fd = create_netlink_socket();
+
+            nfnlh.fd = fd;
+
+            // Initialize sockaddr_nl structures
+            nfnlh.local.nl_family = libc::AF_NETLINK as u16;
+            nfnlh.peer.nl_family = libc::AF_NETLINK as u16;
+
+            // Getsockname to verify socket configuration
+            let mut addr_len = mem::size_of::<libc::sockaddr_nl>() as u32;
+            if getsockname(
+                fd,
+                &mut nfnlh.local as *mut _ as *mut libc::sockaddr,
+                &mut addr_len as *mut _,
+            ) < 0
+                || addr_len != mem::size_of::<libc::sockaddr_nl>() as u32
+            {
+                libc::close(fd);
+
+                return None;
+            }
+
+            if nfnlh.local.nl_family != libc::AF_NETLINK as u16 {
+                libc::close(fd);
+
+                return None;
+            }
+
+            // Set sequence number
+            nfnlh.seq = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+
+            // Set receive buffer size
+            nfnlh.rcv_buffer_size = NFNL_BUFFSIZE as u32;
+
+            nfnlh.recalc_rebind_subscriptions();
+
+            // Final getsockname to get the netlink PID
+            if getsockname(
+                fd,
+                &mut nfnlh.local as *mut _ as *mut libc::sockaddr,
+                &mut addr_len as *mut _,
+            ) < 0
+                || addr_len != mem::size_of::<libc::sockaddr_nl>() as u32
+            {
+                libc::close(fd);
+                return None;
+            }
+
+            // Enable sequence tracking
+            nfnlh.flags |= NFNL_F_SEQTRACK_ENABLED;
+
+            Some(nfnlh)
+        }
     }
 }
 
@@ -316,71 +482,83 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
 fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
     let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
     let sock_fd = create_netlink_socket();
+
     unsafe {
         let table = nftnl_table_alloc();
         if table.is_null() {
             eprintln!("Failed to allocate table");
             return None;
         }
-        nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
-        nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
-        nftnl_table_set_u32(table, NFTNL_TABLE_FLAGS as u16, 0 as u32);
-        nftnl_table_set_u32(table, NFTNL_TABLE_USE as u16, 0);
-        nftnl_table_set_u64(table, NFTNL_TABLE_HANDLE as u16, 0 as u64);
-        nftnl_table_set_u32(table, __NFTNL_TABLE_MAX as u16, u16::MAX as u32);
 
-        let nlhdr = nftnl_nlmsg_build_hdr(
-            buffer.as_mut_ptr() as *mut i8,
-            libc::NFT_MSG_NEWTABLE as u16,
-            libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
-            0,
-        );
-        // Add table
-        nftnl_table_nlmsg_build_payload(nlhdr, table);
+        match NfnlHandle::new() {
+            Some(handler) => {
+                println!("nfnetlink handler created successfully!");
+                nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
+                nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
+                nftnl_table_set_u32(table, NFTNL_TABLE_FLAGS as u16, 0u32);
+                nftnl_table_set_u32(table, NFTNL_TABLE_USE as u16, 0u32);
+                nftnl_table_set_u64(table, NFTNL_TABLE_HANDLE as u16, handler.subscriptions as u64);
 
-        // Bind the socket
-        let _ = bind_nfqueue_socket(sock_fd, 0);
+                let nlhdr = nftnl_nlmsg_build_hdr(
+                    buffer.as_mut_ptr() as *mut i8,
+                    libc::NFT_MSG_NEWTABLE as u16,
+                    libc::AF_NETLINK as u16,
+                    (libc::NLM_F_REQUEST |  libc::NLM_F_ACK) as u16, //libc::NLM_F_CREATE |
+                    handler.seq + 1,
+                );
 
-        if let Err(err) = send_to_kernel(sock_fd, &buffer) {
-            eprintln!("Failed to send TABLE: {}", err);
-            nftnl_table_free(table);
-            exit_program();
+                // Add table
+                nftnl_table_nlmsg_build_payload(nlhdr, table);
+
+                // Bind the socket
+                //let _ = bind_nfqueue_socket(sock_fd, 0);
+
+                if let Err(err) = send_to_kernel(handler.fd, &buffer) {
+                    eprintln!("Failed to send TABLE: {}", err);
+                    nftnl_table_free(table);
+                    exit_program();
+                }
+
+                // Receive the response from the kernel
+                let mut recv_buffer = vec![0u8; 4096]; // Allocate a buffer for the response
+                let mut addr: libc::sockaddr_nl = std::mem::zeroed(); // Address structure for recvfrom
+                let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+
+                let recv_len = libc::recvfrom(
+                    sock_fd,
+                    recv_buffer.as_mut_ptr() as *mut libc::c_void,
+                    recv_buffer.len(),
+                    0,
+                    &mut addr as *mut _ as *mut libc::sockaddr,
+                    &mut addrlen,
+                );
+
+                if recv_len < 0 {
+                    eprintln!("Failed to receive response from kernel");
+                    nftnl_table_free(table);
+                    libc::close(handler.fd);
+                    return None;
+                }
+
+                // Here you would process the response to ensure success.
+                // Example of response validation (Netlink message processing)
+                if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
+                    println!("Table successfully created");
+                } else {
+                    nftnl_table_free(table);
+                    libc::close(handler.fd);
+                    return None;
+                }
+
+                libc::close(handler.fd); //TODO PASS THAT TO THE NEXT FUNCTION!
+                return Some(table)
+            
+            }
+            None => {
+                eprintln!("Failed to create nfnetlink handler.");
+                return None;
+            }
         }
-
-        // Receive the response from the kernel
-        let mut recv_buffer = vec![0u8; 4096]; // Allocate a buffer for the response
-        let mut addr: libc::sockaddr_nl = std::mem::zeroed(); // Address structure for recvfrom
-        let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-
-        let recv_len = libc::recvfrom(
-            sock_fd,
-            recv_buffer.as_mut_ptr() as *mut libc::c_void,
-            recv_buffer.len(),
-            0,
-            &mut addr as *mut _ as *mut libc::sockaddr,
-            &mut addrlen,
-        );
-
-        if recv_len < 0 {
-            eprintln!("Failed to receive response from kernel");
-            nftnl_table_free(table);
-            libc::close(sock_fd);
-            return None;
-        }
-
-        // Here you would process the response to ensure success.
-        // Example of response validation (Netlink message processing)
-        if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
-            println!("Table successfully created");
-        } else {
-            nftnl_table_free(table);
-            libc::close(sock_fd);
-            return None;
-        }
-
-        libc::close(sock_fd);
-        Some(table)
     }
 }
 

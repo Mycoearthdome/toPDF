@@ -611,7 +611,7 @@ fn handle_queue(
     }
 }
 
-fn exit_program() {
+fn exit_program() -> ! {
     exit(1);
 }
 
@@ -846,11 +846,23 @@ fn main() {
     let table_name = CString::new(NFT_TABLE_NAME).unwrap();
     let chain_name = CString::new(NFT_CHAIN_NAME).unwrap();
 
-    // Create table and chain
-    let table = SafePtr::new(create_table(table_name).expect("Failed to create table"));
-    let chain = SafePtr::new(
-        create_chain(table.get(), chain_name.as_ptr()).expect("Failed to create chain"),
-    );
+    // Create table
+    let table = match create_table(table_name) {
+        Some(t) => SafePtr::new(t),
+        None => {
+            eprintln!("Failed to create table");
+            exit_program();
+        }
+    };
+
+    // Create chain
+    let chain = match create_chain(table.get(), chain_name.as_ptr()) {
+        Some(c) => SafePtr::new(c),
+        None => {
+            eprintln!("Failed to create chain");
+            exit_program();
+        }
+    };
 
     let table_arc = Arc::new(Mutex::new(table));
     let chain_arc = Arc::new(Mutex::new(chain));

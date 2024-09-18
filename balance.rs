@@ -232,8 +232,8 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
             libc::NFT_MSG_NEWTABLE as u16,
-            libc::AF_UNSPEC as u16,
-            0, //(libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+            libc::AF_NETLINK as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
             0,
         );
         // Add table
@@ -309,8 +309,8 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
             libc::NFT_MSG_NEWCHAIN as u16,
-            libc::AF_UNSPEC as u16,
-            0,
+            libc::AF_NETLINK as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
             0,
         );
 
@@ -397,8 +397,8 @@ fn create_rule(
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
             libc::NFT_MSG_NEWRULE as u16,
-            libc::AF_UNSPEC as u16,
-            0,
+            libc::AF_NETLINK as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
             queue_num,
         );
 

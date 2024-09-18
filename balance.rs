@@ -175,7 +175,7 @@ fn validate_chain_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
     }
 
     // Assuming successful parsing means the table was created
-    println!("Table creation was successful");
+    println!("Chain creation was successful");
     true
 }
 
@@ -278,7 +278,7 @@ fn create_table(table_name: *const i8) -> Option<*mut nftnl_table> {
         // Here you would process the response to ensure success.
         // Example of response validation (Netlink message processing)
         if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
-            println!("Chain successfully created");
+            println!("Table successfully created");
         } else {
             eprintln!("Failed to create table");
             nftnl_table_free(table);

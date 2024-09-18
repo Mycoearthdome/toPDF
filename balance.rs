@@ -66,6 +66,73 @@ pub enum Verdict {
     NfStop = 5,
 }
 
+fn handle_error(err_code: i32) -> &'static str {
+    match err_code {
+        libc::EACCES => "Permission denied (EACCES)",
+        libc::EADDRINUSE => "Address already in use (EADDRINUSE)",
+        libc::EADDRNOTAVAIL => "Address not available (EADDRNOTAVAIL)",
+        libc::EAFNOSUPPORT => "Address family not supported (EAFNOSUPPORT)",
+        libc::EAGAIN => "Resource temporarily unavailable (EAGAIN)",
+        libc::EALREADY => "Connection already in progress (EALREADY)",
+        libc::EBADF => "Bad file descriptor (EBADF)",
+        libc::EBUSY => "Device or resource busy (EBUSY)",
+        libc::ECONNABORTED => "Connection aborted (ECONNABORTED)",
+        libc::ECONNREFUSED => "Connection refused (ECONNREFUSED)",
+        libc::ECONNRESET => "Connection reset by peer (ECONNRESET)",
+        libc::EDESTADDRREQ => "Destination address required (EDESTADDRREQ)",
+        libc::EDQUOT => "Disk quota exceeded (EDQUOT)",
+        libc::EEXIST => "File exists (EEXIST)",
+        libc::EFAULT => "Bad address (EFAULT)",
+        libc::EHOSTUNREACH => "No route to host (EHOSTUNREACH)",
+        libc::EIDRM => "Identifier removed (EIDRM)",
+        libc::EILSEQ => "Illegal byte sequence (EILSEQ)",
+        libc::EINPROGRESS => "Operation in progress (EINPROGRESS)",
+        libc::EINTR => "Interrupted system call (EINTR)",
+        libc::EINVAL => "Invalid argument (EINVAL)",
+        libc::EIO => "I/O error (EIO)",
+        libc::EISCONN => "Socket is already connected (EISCONN)",
+        libc::EISDIR => "Is a directory (EISDIR)",
+        libc::ELOOP => "Too many levels of symbolic links (ELOOP)",
+        libc::EMFILE => "Too many open files (EMFILE)",
+        libc::EMLINK => "Too many links (EMLINK)",
+        libc::EMSGSIZE => "Message too long (EMSGSIZE)",
+        libc::ENAMETOOLONG => "File name too long (ENAMETOOLONG)",
+        libc::ENETDOWN => "Network is down (ENETDOWN)",
+        libc::ENETRESET => "Connection reset by network (ENETRESET)",
+        libc::ENETUNREACH => "Network is unreachable (ENETUNREACH)",
+        libc::ENFILE => "Too many open files in system (ENFILE)",
+        libc::ENOBUFS => "No buffer space available (ENOBUFS)",
+        libc::ENODEV => "No such device (ENODEV)",
+        libc::ENOENT => "No such file or directory (ENOENT)",
+        libc::ENOEXEC => "Exec format error (ENOEXEC)",
+        libc::ENOLCK => "No locks available (ENOLCK)",
+        libc::ENOMEM => "Out of memory (ENOMEM)",
+        libc::ENOMSG => "No message of desired type (ENOMSG)",
+        libc::ENOPROTOOPT => "Protocol not available (ENOPROTOOPT)",
+        libc::ENOSPC => "No space left on device (ENOSPC)",
+        libc::ENOSYS => "Function not implemented (ENOSYS)",
+        libc::ENOTCONN => "Socket is not connected (ENOTCONN)",
+        libc::ENOTDIR => "Not a directory (ENOTDIR)",
+        libc::ENOTEMPTY => "Directory not empty (ENOTEMPTY)",
+        libc::ENOTSOCK => "Socket operation on non-socket (ENOTSOCK)",
+        libc::ENOTSUP => "Operation not supported (ENOTSUP)",
+        libc::EPERM => "Operation not permitted (EPERM)",
+        libc::EPIPE => "Broken pipe (EPIPE)",
+        libc::EPROTO => "Protocol error (EPROTO)",
+        libc::EPROTONOSUPPORT => "Protocol not supported (EPROTONOSUPPORT)",
+        libc::EPROTOTYPE => "Protocol wrong type for socket (EPROTOTYPE)",
+        libc::ERANGE => "Result too large (ERANGE)",
+        libc::EROFS => "Read-only file system (EROFS)",
+        libc::ESPIPE => "Invalid seek (ESPIPE)",
+        libc::ESRCH => "No such process (ESRCH)",
+        libc::ETIMEDOUT => "Connection timed out (ETIMEDOUT)",
+        libc::ETXTBSY => "Text file busy (ETXTBSY)",
+        libc::EWOULDBLOCK => "Operation would block (EWOULDBLOCK)",
+        libc::EXDEV => "Cross-device link (EXDEV)",
+        _ => "Unknown error",
+    }
+}
+
 fn set_nonblocking(sock_fd: RawFd) -> io::Result<()> {
     let flags =
         fcntl(sock_fd, FcntlArg::F_GETFL).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
@@ -130,10 +197,21 @@ fn validate_table_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
             return false;
         }
 
-        // Here, based on the parsed result, we would check if the table creation was successful.
-        // For now, assuming that parsing success means table creation success.
+        let nlmsg_type = (*nlh).nlmsg_type;
+        let nlmsg_flags = (*nlh).nlmsg_flags;
 
-        // Clean up the parsed table object
+        // Check if the message type indicates an error
+        if nlmsg_type == libc::NLMSG_ERROR as u16 {
+            // Extract the error code from the message
+            let error = (*(recv_buffer.as_ptr() as *const libc::nlmsgerr)).error;
+            eprintln!("Received error from kernel: {}", handle_error(error));
+            return false;
+        }
+
+        // Optionally check for other flags, like acknowledgment
+        if nlmsg_flags & libc::NLM_F_ACK as u16 != 0 {
+            println!("Received acknowledgment from kernel");
+        }
         nftnl_table_free(parsed_table);
     }
 
@@ -167,9 +245,21 @@ fn validate_chain_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
             return false;
         }
 
-        // Here, based on the parsed result, we would check if the table creation was successful.
-        // For now, assuming that parsing success means table creation success.
+        let nlmsg_type = (*nlh).nlmsg_type;
+        let nlmsg_flags = (*nlh).nlmsg_flags;
 
+        // Check if the message type indicates an error
+        if nlmsg_type == libc::NLMSG_ERROR as u16 {
+            // Extract the error code from the message
+            let error = (*(recv_buffer.as_ptr() as *const libc::nlmsgerr)).error;
+            eprintln!("Received error from kernel: {}", handle_error(error));
+            return false;
+        }
+
+        // Optionally check for other flags, like acknowledgment
+        if nlmsg_flags & libc::NLM_F_ACK as u16 != 0 {
+            println!("Received acknowledgment from kernel");
+        }
         // Clean up the parsed table object
         nftnl_chain_free(parsed_chain);
     }
@@ -204,8 +294,21 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
             return false;
         }
 
-        // Here, based on the parsed result, we would check if the table creation was successful.
-        // For now, assuming that parsing success means table creation success.
+        let nlmsg_type = (*nlh).nlmsg_type;
+        let nlmsg_flags = (*nlh).nlmsg_flags;
+
+        // Check if the message type indicates an error
+        if nlmsg_type == libc::NLMSG_ERROR as u16 {
+            // Extract the error code from the message
+            let error = (*(recv_buffer.as_ptr() as *const libc::nlmsgerr)).error;
+            eprintln!("Received error from kernel: {}", handle_error(error));
+            return false;
+        }
+
+        // Optionally check for other flags, like acknowledgment
+        if nlmsg_flags & libc::NLM_F_ACK as u16 != 0 {
+            println!("Received acknowledgment from kernel");
+        }
 
         // Clean up the parsed table object
         nftnl_rule_free(parsed_rule);
@@ -231,9 +334,10 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            libc::NFT_MSG_NEWTABLE as u16,
+            NFTNL_CMD_ADD as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWTABLE | libc::NLM_F_ACK)
+                as u16,
             0,
         );
         // Add table
@@ -308,9 +412,10 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            libc::NFT_MSG_NEWCHAIN as u16,
+            NFTNL_CMD_ADD as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWCHAIN | libc::NLM_F_ACK)
+                as u16,
             0,
         );
 
@@ -396,9 +501,10 @@ fn create_rule(
         // add rule
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            libc::NFT_MSG_NEWRULE as u16,
+            NFTNL_CMD_ADD as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE | libc::NLM_F_ACK)
+                as u16,
             queue_num,
         );
 

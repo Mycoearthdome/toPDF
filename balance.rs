@@ -1,6 +1,6 @@
 extern crate ctrlc;
+extern crate netlink;
 extern crate nftnl_sys;
-///BE MORE SEQUENTIAL WITH TABLE THEN CHAIN THEN RULE.
 extern crate nix;
 
 use libc::{self, sockaddr_nl, NFPROTO_IPV4};
@@ -19,7 +19,7 @@ use std::thread;
 
 // Constants for raw table configuration
 const NFT_TABLE_NAME: &str = "raw";
-const NFT_CHAIN_NAME: &str = "OUTPUT";
+const NFT_CHAIN_NAME: &str = "output";
 const NFT_RULE_QUEUE_MAX_NUM: u32 = 10;
 const NFT_PROTOCOL_IP: u32 = libc::IPPROTO_IP as u32;
 
@@ -216,7 +216,7 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
     true
 }
 
-fn create_table(table_name: *const i8) -> Option<*mut nftnl_table> {
+fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
     let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
     let sock_fd = create_netlink_socket();
     unsafe {
@@ -227,19 +227,13 @@ fn create_table(table_name: *const i8) -> Option<*mut nftnl_table> {
         }
 
         nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
-        nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name);
-
-        nftnl_table_set(
-            table,
-            nftnl_sys::NFTNL_TABLE_NAME as u16,
-            table_name as *const c_void,
-        );
+        nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
-            NFPROTO_IPV4 as u16,
-            0,
+            libc::NFT_MSG_NEWTABLE as u16,
+            libc::AF_UNSPEC as u16,
+            0, //(libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
             0,
         );
         // Add table
@@ -314,8 +308,8 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
-            NFPROTO_IPV4 as u16,
+            libc::NFT_MSG_NEWCHAIN as u16,
+            libc::AF_UNSPEC as u16,
             0,
             0,
         );
@@ -402,10 +396,10 @@ fn create_rule(
         // add rule
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
-            NFPROTO_IPV4 as u16,
+            libc::NFT_MSG_NEWRULE as u16,
+            libc::AF_UNSPEC as u16,
             0,
-            3,
+            queue_num,
         );
 
         nftnl_rule_nlmsg_build_payload(nlhdr, rule);
@@ -747,7 +741,7 @@ fn main() {
     let chain_name = CString::new(NFT_CHAIN_NAME).unwrap();
 
     // Create table and chain
-    let table = SafePtr::new(create_table(table_name.as_ptr()).expect("Failed to create table"));
+    let table = SafePtr::new(create_table(table_name).expect("Failed to create table"));
     let chain = SafePtr::new(
         create_chain(table.get(), chain_name.as_ptr()).expect("Failed to create chain"),
     );

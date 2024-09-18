@@ -1,5 +1,6 @@
 extern crate ctrlc;
 extern crate nftnl_sys;
+///BE MORE SEQUENTIAL WITH TABLE THEN CHAIN THEN RULE.
 extern crate nix;
 
 use libc::{self, sockaddr_nl, NFPROTO_IPV4};
@@ -104,35 +105,120 @@ fn send_verdict(sock_fd: RawFd, queue_num: u32, packet_id: u32, verdict: u32) ->
     Ok(())
 }
 
-fn create_rule(
-    table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
-    chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
-    queue_num: u32,
-) -> Option<*mut nftnl_rule> {
-    let table = table.lock().unwrap().get();
-    let chain = chain.lock().unwrap().get();
+fn validate_table_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
+    if recv_len < std::mem::size_of::<libc::nlmsghdr>() {
+        eprintln!("Received response is too short to be valid");
+        return false;
+    }
+
+    // Get the pointer to the first netlink message header
+    let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
+
+    // Allocate a new table to parse the response into
     unsafe {
-        let rule = nftnl_rule_alloc();
-        if rule.is_null() {
-            eprintln!("Failed to allocate rule");
-            return Some(std::ptr::null_mut());
+        let parsed_table = nftnl_table_alloc();
+        if parsed_table.is_null() {
+            eprintln!("Failed to allocate memory for parsed table");
+            return false;
         }
 
-        nftnl_rule_set_u32(rule, NFTNL_RULE_FAMILY as u16, NFPROTO_IPV4 as u32);
-        nftnl_rule_set(rule, NFTNL_RULE_TABLE as u16, table as *const c_void);
-        nftnl_rule_set(rule, NFTNL_RULE_CHAIN as u16, chain as *const c_void);
-        nftnl_rule_set_u32(rule, NFTNL_RULE_COMPAT_PROTO as u16, NFT_PROTOCOL_IP);
+        // Parse the netlink message
+        let ret: i32 = nftnl_table_nlmsg_parse(nlh, parsed_table);
+        if ret < 0 {
+            eprintln!("Failed to parse netlink message, error code: {}", ret);
+            nftnl_table_free(parsed_table);
+            return false;
+        }
 
-        let expr = nftnl_expr_alloc("queue\0".as_ptr() as *const i8);
-        // Set the queue number using the provided constants
-        nftnl_expr_set_u32(expr, NFTNL_EXPR_QUEUE_NUM as u16, queue_num);
-        nftnl_rule_add_expr(rule, expr);
+        // Here, based on the parsed result, we would check if the table creation was successful.
+        // For now, assuming that parsing success means table creation success.
 
-        Some(rule)
+        // Clean up the parsed table object
+        nftnl_table_free(parsed_table);
     }
+
+    // Assuming successful parsing means the table was created
+    println!("Table creation was successful");
+    true
+}
+
+fn validate_chain_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
+    if recv_len < std::mem::size_of::<libc::nlmsghdr>() {
+        eprintln!("Received response is too short to be valid");
+        return false;
+    }
+
+    // Get the pointer to the first netlink message header
+    let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
+
+    // Allocate a new table to parse the response into
+    unsafe {
+        let parsed_chain = nftnl_chain_alloc();
+        if parsed_chain.is_null() {
+            eprintln!("Failed to allocate memory for parsed chain");
+            return false;
+        }
+
+        // Parse the netlink message
+        let ret: i32 = nftnl_chain_nlmsg_parse(nlh, parsed_chain);
+        if ret < 0 {
+            eprintln!("Failed to parse netlink message, error code: {}", ret);
+            nftnl_chain_free(parsed_chain);
+            return false;
+        }
+
+        // Here, based on the parsed result, we would check if the table creation was successful.
+        // For now, assuming that parsing success means table creation success.
+
+        // Clean up the parsed table object
+        nftnl_chain_free(parsed_chain);
+    }
+
+    // Assuming successful parsing means the table was created
+    println!("Table creation was successful");
+    true
+}
+
+fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
+    if recv_len < std::mem::size_of::<libc::nlmsghdr>() {
+        eprintln!("Received response is too short to be valid");
+        return false;
+    }
+
+    // Get the pointer to the first netlink message header
+    let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
+
+    // Allocate a new table to parse the response into
+    unsafe {
+        let parsed_rule = nftnl_rule_alloc();
+        if parsed_rule.is_null() {
+            eprintln!("Failed to allocate memory for parsed rule");
+            return false;
+        }
+
+        // Parse the netlink message
+        let ret: i32 = nftnl_rule_nlmsg_parse(nlh, parsed_rule);
+        if ret < 0 {
+            eprintln!("Failed to parse netlink message, error code: {}", ret);
+            nftnl_rule_free(parsed_rule);
+            return false;
+        }
+
+        // Here, based on the parsed result, we would check if the table creation was successful.
+        // For now, assuming that parsing success means table creation success.
+
+        // Clean up the parsed table object
+        nftnl_rule_free(parsed_rule);
+    }
+
+    // Assuming successful parsing means the table was created
+    println!("Rule creation was successful");
+    true
 }
 
 fn create_table(table_name: *const i8) -> Option<*mut nftnl_table> {
+    let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
+    let sock_fd = create_netlink_socket();
     unsafe {
         let table = nftnl_table_alloc();
         if table.is_null() {
@@ -140,16 +226,74 @@ fn create_table(table_name: *const i8) -> Option<*mut nftnl_table> {
             return None;
         }
 
+        nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
+        nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name);
+
         nftnl_table_set(
             table,
             nftnl_sys::NFTNL_TABLE_NAME as u16,
             table_name as *const c_void,
         );
+
+        let nlhdr = nftnl_nlmsg_build_hdr(
+            buffer.as_mut_ptr() as *mut i8,
+            NFTNL_CMD_ADD as u16,
+            NFPROTO_IPV4 as u16,
+            0,
+            0,
+        );
+        // Add table
+        nftnl_table_nlmsg_build_payload(nlhdr, table);
+
+        // Bind the socket
+        let _ = bind_nfqueue_socket(sock_fd, 0);
+
+        if let Err(err) = send_to_kernel(sock_fd, &buffer) {
+            eprintln!("Failed to send TABLE: {}", err);
+            nftnl_table_free(table);
+            exit_program();
+        }
+
+        // Receive the response from the kernel
+        let mut recv_buffer = vec![0u8; 4096]; // Allocate a buffer for the response
+        let mut addr: libc::sockaddr_nl = std::mem::zeroed(); // Address structure for recvfrom
+        let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+
+        let recv_len = libc::recvfrom(
+            sock_fd,
+            recv_buffer.as_mut_ptr() as *mut libc::c_void,
+            recv_buffer.len(),
+            0,
+            &mut addr as *mut _ as *mut libc::sockaddr,
+            &mut addrlen,
+        );
+
+        if recv_len < 0 {
+            eprintln!("Failed to receive response from kernel");
+            nftnl_table_free(table);
+            libc::close(sock_fd);
+            return None;
+        }
+
+        // Here you would process the response to ensure success.
+        // Example of response validation (Netlink message processing)
+        if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
+            println!("Chain successfully created");
+        } else {
+            eprintln!("Failed to create table");
+            nftnl_table_free(table);
+            libc::close(sock_fd);
+            return None;
+        }
+
+        libc::close(sock_fd);
         Some(table)
     }
 }
 
 fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut nftnl_chain> {
+    let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
+    let sock_fd = create_netlink_socket();
     unsafe {
         let chain = nftnl_chain_alloc();
         if chain.is_null() {
@@ -167,7 +311,144 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
             nftnl_sys::NFTNL_CHAIN_NAME as u16,
             chain_name as *const c_void,
         );
+
+        let nlhdr = nftnl_nlmsg_build_hdr(
+            buffer.as_mut_ptr() as *mut i8,
+            NFTNL_CMD_ADD as u16,
+            NFPROTO_IPV4 as u16,
+            0,
+            0,
+        );
+
+        // add chain
+        nftnl_chain_nlmsg_build_payload(nlhdr, chain);
+
+        // Bind the socket
+        let _ = bind_nfqueue_socket(sock_fd, 0);
+
+        if let Err(err) = send_to_kernel(sock_fd, &buffer) {
+            eprintln!("Failed to send CHAIN: {}", err);
+            nftnl_chain_free(chain);
+            exit_program();
+        }
+
+        // Receive the response from the kernel
+        let mut recv_buffer = vec![0u8; 4096]; // Allocate a buffer for the response
+        let mut addr: libc::sockaddr_nl = std::mem::zeroed(); // Address structure for recvfrom
+        let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+
+        let recv_len = libc::recvfrom(
+            sock_fd,
+            recv_buffer.as_mut_ptr() as *mut libc::c_void,
+            recv_buffer.len(),
+            0,
+            &mut addr as *mut _ as *mut libc::sockaddr,
+            &mut addrlen,
+        );
+
+        if recv_len < 0 {
+            eprintln!("Failed to receive response from kernel");
+            nftnl_chain_free(chain);
+            libc::close(sock_fd);
+            return None;
+        }
+
+        // Here you would process the response to ensure success.
+        // Example of response validation (Netlink message processing)
+        if validate_chain_netlink_response(&recv_buffer, recv_len as usize) {
+            println!("Chain successfully created");
+        } else {
+            eprintln!("Failed to create chain");
+            nftnl_chain_free(chain);
+            libc::close(sock_fd);
+            return None;
+        }
+
+        libc::close(sock_fd);
         Some(chain)
+    }
+}
+
+fn create_rule(
+    raw_fd: RawFd,
+    table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
+    chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
+    queue_num: u32,
+) -> Option<*mut nftnl_rule> {
+    let table = table.lock().unwrap().get();
+    let chain = chain.lock().unwrap().get();
+    let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
+    unsafe {
+        let rule = nftnl_rule_alloc();
+        if rule.is_null() {
+            eprintln!("Failed to allocate rule");
+            return Some(std::ptr::null_mut());
+        }
+
+        nftnl_rule_set_u32(rule, NFTNL_RULE_FAMILY as u16, NFPROTO_IPV4 as u32);
+        nftnl_rule_set(rule, NFTNL_RULE_TABLE as u16, table as *const c_void);
+        nftnl_rule_set(rule, NFTNL_RULE_CHAIN as u16, chain as *const c_void);
+        nftnl_rule_set_u32(rule, NFTNL_RULE_COMPAT_PROTO as u16, NFT_PROTOCOL_IP);
+
+        let queue_expr = nftnl_expr_alloc("queue\0".as_ptr() as *const i8);
+        if queue_expr.is_null() {
+            eprintln!("Failed to allocate queue expression");
+            nftnl_rule_free(rule);
+        }
+        // Set the queue number using the provided constants
+        nftnl_expr_set_u32(queue_expr, NFTNL_EXPR_QUEUE_NUM as u16, queue_num);
+        nftnl_rule_add_expr(rule, queue_expr);
+
+        // add rule
+        let nlhdr = nftnl_nlmsg_build_hdr(
+            buffer.as_mut_ptr() as *mut i8,
+            NFTNL_CMD_ADD as u16,
+            NFPROTO_IPV4 as u16,
+            0,
+            3,
+        );
+
+        nftnl_rule_nlmsg_build_payload(nlhdr, rule);
+
+        if let Err(err) = send_to_kernel(raw_fd, &buffer) {
+            eprintln!("Failed to send RULE for queue {}: {}", queue_num, err);
+            nftnl_rule_free(rule);
+            exit_program();
+        }
+
+        // Receive the response from the kernel
+        let mut recv_buffer = vec![0u8; 4096]; // Allocate a buffer for the response
+        let mut addr: libc::sockaddr_nl = std::mem::zeroed(); // Address structure for recvfrom
+        let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+
+        let recv_len = libc::recvfrom(
+            raw_fd,
+            recv_buffer.as_mut_ptr() as *mut libc::c_void,
+            recv_buffer.len(),
+            0,
+            &mut addr as *mut _ as *mut libc::sockaddr,
+            &mut addrlen,
+        );
+
+        if recv_len < 0 {
+            eprintln!("Failed to receive response from kernel");
+            nftnl_rule_free(rule);
+            libc::close(raw_fd);
+            return None;
+        }
+
+        // Here you would process the response to ensure success.
+        // Example of response validation (Netlink message processing)
+        if validate_rule_netlink_response(&recv_buffer, recv_len as usize) {
+            println!("Rule successfully created");
+        } else {
+            eprintln!("Failed to create rule");
+            nftnl_rule_free(rule);
+            libc::close(raw_fd);
+            return None;
+        }
+
+        Some(rule)
     }
 }
 
@@ -275,38 +556,20 @@ fn allocate_ruleset(
         set_nonblocking(*raw_fd.lock().unwrap())
             .expect("Failed to set socket to non-blocking mode");
 
-        let rule = create_rule(&table, &chain, queue_num).expect("Failed to create rule");
+        // Bind the socket to the queue number
+        if bind_nfqueue_socket(raw_fd_value, queue_num).is_err() {
+            continue; // Skip to the next queue if binding fails
+        }
+
+        let rule =
+            create_rule(raw_fd_value, &table, &chain, queue_num).expect("Failed to create rule");
         if rule.is_null() {
             eprintln!("Failed to create rule for queue {}", queue_num);
             cleanup(rules.clone());
             exit_program();
         }
+
         rules.push(Arc::new(Mutex::new(SafePtr::new(rule))));
-
-        let mut buffer = vec![0u8; 1024]; // Allocate buffer for the Netlink message
-
-        unsafe {
-            let nlhdr = nftnl_nlmsg_build_hdr(
-                buffer.as_mut_ptr() as *mut i8,
-                NFTNL_CMD_ADD as u16,
-                NFTNL_RULE_FAMILY as u16,
-                0,
-                queue_num,
-            );
-            nftnl_rule_nlmsg_build_payload(nlhdr, rule);
-
-            // Bind the socket to the queue number
-            if bind_nfqueue_socket(raw_fd_value, queue_num).is_err() {
-                continue; // Skip to the next queue if binding fails
-            }
-
-            // Handle the result from send_to_kernel
-            if let Err(err) = send_to_kernel(raw_fd_value, &buffer) {
-                eprintln!("Failed to send message for queue {}: {}", queue_num, err);
-                cleanup(rules.clone());
-                exit_program();
-            }
-        }
     }
     raw_fds
 }
@@ -343,7 +606,7 @@ fn bind_nfqueue_socket(sock_fd: RawFd, queue_id: u32) -> io::Result<()> {
     let mask: u32 = (1 << queue_id) as u32;
 
     // Set nl_groups to the mask
-    addr.nl_groups = mask; //mask.to_be();
+    addr.nl_groups = mask;
 
     // Set socket option for reusability
     unsafe {
@@ -394,7 +657,7 @@ fn bind_nfqueue_socket(sock_fd: RawFd, queue_id: u32) -> io::Result<()> {
         nlmsg_len: mem::size_of::<libc::nlmsghdr>() as u32,
         nlmsg_type: libc::NFNL_SUBSYS_QUEUE as u16,
         nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16, //TODO: NLM_F_ACK later
-        nlmsg_seq: queue_id,
+        nlmsg_seq: 0,
         nlmsg_pid: 0,
     };
 

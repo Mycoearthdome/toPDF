@@ -51,12 +51,6 @@ struct NfQueueMsg {
     verdict: u32,
 }
 
-#[repr(C, packed)]
-struct Nla {
-    nla_len: u16,
-    nla_type: u16,
-}
-
 pub enum Verdict {
     NfAccept = 1, //NFQUEUE = 1
     NfDrop = 0,   //NFQUEUE = 0
@@ -328,16 +322,18 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
             eprintln!("Failed to allocate table");
             return None;
         }
-
-        nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
         nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
+        nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
+        nftnl_table_set_u32(table, NFTNL_TABLE_FLAGS as u16, 0 as u32);
+        nftnl_table_set_u32(table, NFTNL_TABLE_USE as u16, 0);
+        nftnl_table_set_u64(table, NFTNL_TABLE_HANDLE as u16, 0 as u64);
+        nftnl_table_set_u32(table, __NFTNL_TABLE_MAX as u16, u16::MAX as u32);
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
+            libc::NFT_MSG_NEWTABLE as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWTABLE | libc::NLM_F_ACK)
-                as u16,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
             0,
         );
         // Add table
@@ -411,7 +407,7 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
 
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
+            libc::NLMSG_DONE as u16,
             libc::AF_NETLINK as u16,
             (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWCHAIN | libc::NLM_F_ACK)
                 as u16,
@@ -499,7 +495,7 @@ fn create_rule(
         // add rule
         let nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            NFTNL_CMD_ADD as u16,
+            libc::NLMSG_DONE as u16,
             libc::AF_NETLINK as u16,
             (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE | libc::NLM_F_ACK)
                 as u16,
@@ -701,7 +697,7 @@ fn bind_nfqueue_socket(sock_fd: RawFd, queue_id: u32) -> io::Result<()> {
     addr.nl_family = libc::AF_NETLINK as u16;
     addr.nl_pid = 0;
     // Create a bitmask for the specified queue_id
-    let mask: u32 = (1 << queue_id) as u32;
+    let mask: u32 = queue_id as u32;
 
     // Set nl_groups to the mask
     addr.nl_groups = mask;
@@ -749,71 +745,6 @@ fn bind_nfqueue_socket(sock_fd: RawFd, queue_id: u32) -> io::Result<()> {
         }
         return Err(error_code);
     }
-
-    // Prepare netlink message
-    let msg = libc::nlmsghdr {
-        nlmsg_len: mem::size_of::<libc::nlmsghdr>() as u32,
-        nlmsg_type: libc::NFNL_SUBSYS_QUEUE as u16,
-        nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16, //TODO: NLM_F_ACK later
-        nlmsg_seq: 0,
-        nlmsg_pid: 0,
-    };
-
-    let mut buf = [0u8; 1024];
-    let mut offset = 0;
-
-    // Configure NFQUEUE protocol attributes
-    // Max length attribute
-    let maxlen = 1024;
-    let attr = Nla {
-        nla_len: mem::size_of::<Nla>() as u16 + 2, // 2 bytes for maxlen
-        nla_type: libc::NFQA_CFG_QUEUE_MAXLEN as u16,
-    };
-
-    // Fill the attribute buffer
-    let attr_data = &mut buf[offset..offset + attr.nla_len as usize];
-    attr_data.copy_from_slice(&[
-        attr.nla_len as u8,
-        attr.nla_type as u8,
-        (maxlen >> 8) as u8,
-        maxlen as u8,
-        0, // padding
-        0, // padding
-    ]);
-    offset += attr.nla_len as usize;
-
-    // Flags attribute
-    let flags = libc::NFQA_CFG_F_FAIL_OPEN | libc::NFQA_CFG_F_CONNTRACK;
-    let attr_flags = Nla {
-        nla_len: mem::size_of::<Nla>() as u16 + 2, // 2 bytes for flags
-        nla_type: libc::NFQA_CFG_FLAGS as u16,
-    };
-
-    // Fill the flags attribute buffer
-    let attr_flags_data = &mut buf[offset..offset + attr_flags.nla_len as usize];
-    attr_flags_data.copy_from_slice(&[
-        attr_flags.nla_len as u8,
-        attr_flags.nla_type as u8,
-        (flags >> 8) as u8,
-        flags as u8,
-        0, // padding
-        0, // padding
-    ]);
-    offset += attr_flags.nla_len as usize;
-
-    // Send the message
-    let ret = unsafe {
-        libc::send(
-            sock_fd,
-            &msg as *const _ as *const c_void,
-            msg.nlmsg_len as usize + offset, // Include the total length
-            0,
-        )
-    };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
     Ok(())
 }
 

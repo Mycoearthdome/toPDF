@@ -154,7 +154,6 @@ struct NfnlHandle {
     last_nlhdr: *mut libc::nlmsghdr, // Pointer to the last Netlink message header
     subsys: [NfnlSubsysHandle; NFNL_MAX_SUBSYS + 1], // Array of subsystem handles
 }
-
 impl Default for NfnlHandle {
     fn default() -> Self {
         NfnlHandle {
@@ -332,14 +331,14 @@ fn send_verdict(sock_fd: RawFd, queue_num: u32, packet_id: u32, verdict: u32) ->
     Ok(())
 }
 
-fn validate_table_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
+fn validate_table_netlink_response(handler: &NfnlHandle, recv_buffer: &[u8], recv_len: usize) -> bool {
     if recv_len < std::mem::size_of::<libc::nlmsghdr>() {
         eprintln!("Received response is too short to be valid");
         return false;
     }
 
     // Get the pointer to the first netlink message header
-    let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
+    //let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
 
     // Allocate a new table to parse the response into
     unsafe {
@@ -350,15 +349,16 @@ fn validate_table_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
         }
 
         // Parse the netlink message
-        let ret: i32 = nftnl_table_nlmsg_parse(nlh, parsed_table);
+        let last_nlhdr = handler.last_nlhdr;
+        let ret: i32 = nftnl_table_nlmsg_parse(last_nlhdr as *const libc::nlmsghdr, parsed_table);
         if ret < 0 {
             eprintln!("Failed to parse netlink message, error code: {}", ret);
             nftnl_table_free(parsed_table);
             return false;
         }
 
-        let nlmsg_type = (*nlh).nlmsg_type;
-        let nlmsg_flags = (*nlh).nlmsg_flags;
+        let nlmsg_type =  (*last_nlhdr).nlmsg_type;
+        let nlmsg_flags = (*last_nlhdr).nlmsg_flags;
 
         // Check if the message type indicates an error
         if nlmsg_type == libc::NLMSG_ERROR as u16 {
@@ -380,14 +380,14 @@ fn validate_table_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
     true
 }
 
-fn validate_chain_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
+fn validate_chain_netlink_response(handler: &NfnlHandle, recv_buffer: &[u8], recv_len: usize) -> bool {
     if recv_len < std::mem::size_of::<libc::nlmsghdr>() {
         eprintln!("Received response is too short to be valid");
         return false;
     }
 
     // Get the pointer to the first netlink message header
-    let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
+    //let nlh: *const libc::nlmsghdr = recv_buffer.as_ptr() as *const libc::nlmsghdr;
 
     // Allocate a new table to parse the response into
     unsafe {
@@ -398,15 +398,16 @@ fn validate_chain_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool 
         }
 
         // Parse the netlink message
-        let ret: i32 = nftnl_chain_nlmsg_parse(nlh, parsed_chain);
+        let last_nlhdr = handler.last_nlhdr;
+        let ret: i32 = nftnl_chain_nlmsg_parse(last_nlhdr as *const libc::nlmsghdr, parsed_chain);
         if ret < 0 {
             eprintln!("Failed to parse netlink message, error code: {}", ret);
             nftnl_chain_free(parsed_chain);
             return false;
         }
 
-        let nlmsg_type = (*nlh).nlmsg_type;
-        let nlmsg_flags = (*nlh).nlmsg_flags;
+        let nlmsg_type = (*last_nlhdr).nlmsg_type;
+        let nlmsg_flags = (*last_nlhdr).nlmsg_flags;
 
         // Check if the message type indicates an error
         if nlmsg_type == libc::NLMSG_ERROR as u16 {
@@ -479,19 +480,19 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
     true
 }
 
-fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
+fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
     let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
-    let sock_fd = create_netlink_socket();
-
     unsafe {
-        let table = nftnl_table_alloc();
-        if table.is_null() {
-            eprintln!("Failed to allocate table");
-            return None;
-        }
-
+        
         match NfnlHandle::new() {
-            Some(handler) => {
+            Some(mut handler) => {
+                // Allocate a new table
+                let table = nftnl_table_alloc();
+                if table.is_null() {
+                    eprintln!("Failed to allocate table");
+                    return (None, handler);
+                }
+
                 println!("nfnetlink handler created successfully!");
                 nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
                 nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
@@ -499,7 +500,7 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
                 nftnl_table_set_u32(table, NFTNL_TABLE_USE as u16, 0u32);
                 nftnl_table_set_u64(table, NFTNL_TABLE_HANDLE as u16, handler.subscriptions as u64);
 
-                let nlhdr = nftnl_nlmsg_build_hdr(
+                handler.last_nlhdr = nftnl_nlmsg_build_hdr(
                     buffer.as_mut_ptr() as *mut i8,
                     libc::NFT_MSG_NEWTABLE as u16,
                     libc::AF_NETLINK as u16,
@@ -508,7 +509,7 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
                 );
 
                 // Add table
-                nftnl_table_nlmsg_build_payload(nlhdr, table);
+                nftnl_table_nlmsg_build_payload(handler.last_nlhdr, table);
 
                 // Bind the socket
                 //let _ = bind_nfqueue_socket(sock_fd, 0);
@@ -525,7 +526,7 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
                 let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
 
                 let recv_len = libc::recvfrom(
-                    sock_fd,
+                    handler.fd,
                     recv_buffer.as_mut_ptr() as *mut libc::c_void,
                     recv_buffer.len(),
                     0,
@@ -537,39 +538,38 @@ fn create_table(table_name: CString) -> Option<*mut nftnl_table> {
                     eprintln!("Failed to receive response from kernel");
                     nftnl_table_free(table);
                     libc::close(handler.fd);
-                    return None;
+                    return (None, handler);
                 }
 
                 // Here you would process the response to ensure success.
                 // Example of response validation (Netlink message processing)
-                if validate_table_netlink_response(&recv_buffer, recv_len as usize) {
+                if validate_table_netlink_response(&handler, &recv_buffer, recv_len as usize) {
                     println!("Table successfully created");
                 } else {
                     nftnl_table_free(table);
                     libc::close(handler.fd);
-                    return None;
+                    return (None, handler);
                 }
 
-                libc::close(handler.fd); //TODO PASS THAT TO THE NEXT FUNCTION!
-                return Some(table)
+                //libc::close(handler.fd); //TODO PASS THAT TO THE NEXT FUNCTION && close the handler at the END!
+                return (Some(table), handler);
             
             }
             None => {
                 eprintln!("Failed to create nfnetlink handler.");
-                return None;
+                return (None, NfnlHandle::default());
             }
         }
     }
 }
 
-fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut nftnl_chain> {
+fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: *const i8) -> (Option<*mut nftnl_chain>, NfnlHandle) {
     let mut buffer = vec![0u8; 4096]; // Allocate buffer for the Netlink message
-    let sock_fd = create_netlink_socket();
     unsafe {
         let chain = nftnl_chain_alloc();
         if chain.is_null() {
             eprintln!("Failed to allocate chain");
-            return None;
+            return (None, handler);
         }
 
         nftnl_chain_set(
@@ -583,7 +583,7 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
             chain_name as *const c_void,
         );
 
-        let nlhdr = nftnl_nlmsg_build_hdr(
+        handler.last_nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
             libc::NLMSG_DONE as u16,
             libc::AF_NETLINK as u16,
@@ -593,12 +593,12 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
         );
 
         // add chain
-        nftnl_chain_nlmsg_build_payload(nlhdr, chain);
+        nftnl_chain_nlmsg_build_payload(handler.last_nlhdr, chain);
 
         // Bind the socket
-        let _ = bind_nfqueue_socket(sock_fd, 0);
+        //let _ = bind_nfqueue_socket(handler.fd, 0);
 
-        if let Err(err) = send_to_kernel(sock_fd, &buffer) {
+        if let Err(err) = send_to_kernel(handler.fd, &buffer) {
             eprintln!("Failed to send CHAIN: {}", err);
             nftnl_chain_free(chain);
             exit_program();
@@ -610,7 +610,7 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
         let mut addrlen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
 
         let recv_len = libc::recvfrom(
-            sock_fd,
+            handler.fd,
             recv_buffer.as_mut_ptr() as *mut libc::c_void,
             recv_buffer.len(),
             0,
@@ -621,22 +621,22 @@ fn create_chain(table: *mut nftnl_table, chain_name: *const i8) -> Option<*mut n
         if recv_len < 0 {
             eprintln!("Failed to receive response from kernel");
             nftnl_chain_free(chain);
-            libc::close(sock_fd);
-            return None;
+            libc::close(handler.fd);
+            return (None, handler);
         }
 
         // Here you would process the response to ensure success.
         // Example of response validation (Netlink message processing)
-        if validate_chain_netlink_response(&recv_buffer, recv_len as usize) {
+        if validate_chain_netlink_response(&handler, &recv_buffer, recv_len as usize) {
             println!("Chain successfully created");
         } else {
             nftnl_chain_free(chain);
-            libc::close(sock_fd);
-            return None;
+            libc::close(handler.fd);
+            return (None, handler);
         }
 
-        libc::close(sock_fd);
-        Some(chain)
+        //libc::close(sock_fd);
+        return (Some(chain), handler);
     }
 }
 
@@ -808,6 +808,7 @@ fn cleanup(rules: Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>) {
 }
 
 fn allocate_ruleset(
+    handler: &NfnlHandle,
     table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
     chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
     rules: &mut Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>,
@@ -818,21 +819,15 @@ fn allocate_ruleset(
 
         let raw_fd = raw_fds.last().unwrap().clone();
 
-        let raw_fd_value = *raw_fd.lock().unwrap();
-
-        if raw_fd_value == -1 {
-            eprintln!("Failed to create netlink socket");
-            exit_program();
-        }
         set_nonblocking(*raw_fd.lock().unwrap())
             .expect("Failed to set socket to non-blocking mode");
 
         // Bind the socket to the queue number
-        if bind_nfqueue_socket(raw_fd_value, queue_num).is_err() {
+        if bind_nfqueue_socket(*raw_fd.lock().unwrap(), queue_num).is_err() {
             continue; // Skip to the next queue if binding fails
         }
 
-        let rule = match create_rule(raw_fd_value, &table, &chain, queue_num) {
+        let rule = match create_rule(handler.fd, &table, &chain, queue_num) {
             Some(r) => r,
             None => {
                 eprintln!("Failed to create rule for queue {}", queue_num);
@@ -954,18 +949,18 @@ fn main() {
     let chain_name = CString::new(NFT_CHAIN_NAME).unwrap();
 
     // Create table
-    let table = match create_table(table_name) {
-        Some(t) => SafePtr::new(t),
-        None => {
+    let (table, handler) = match create_table(table_name) {
+        (Some(t), handler) => (SafePtr::new(t), handler),
+        (None, _handler) => {
             eprintln!("Failed to create table");
             exit_program();
         }
     };
 
     // Create chain
-    let chain = match create_chain(table.get(), chain_name.as_ptr()) {
-        Some(c) => SafePtr::new(c),
-        None => {
+    let (chain, handler) = match create_chain(handler, table.get(), chain_name.as_ptr()) {
+        (Some(c), handler) => (SafePtr::new(c), handler),
+        (None, _handler) => {
             eprintln!("Failed to create chain");
             exit_program();
         }
@@ -973,9 +968,10 @@ fn main() {
 
     let table_arc = Arc::new(Mutex::new(table));
     let chain_arc = Arc::new(Mutex::new(chain));
+
     let rules = Arc::new(Mutex::new(Vec::new()));
 
-    let raw_fds = allocate_ruleset(&table_arc, &chain_arc, &mut *rules.lock().unwrap());
+    let raw_fds = allocate_ruleset(&handler, &table_arc, &chain_arc, &mut *rules.lock().unwrap());
 
     let running = Arc::new(AtomicBool::new(true));
 
@@ -986,13 +982,15 @@ fn main() {
         let running_clone = Arc::clone(&running);
 
         // Spawn a thread for handling packets on this queue
-        let handle = thread::spawn(move || {
-            handle_queue(
-                stdout_clone,
-                *raw_fd_thread.lock().unwrap(),
-                queue_id,
-                running_clone,
-            );
+        let handle = thread::spawn({;
+            move || {
+                handle_queue(
+                    stdout_clone,
+                    *raw_fd_thread.lock().unwrap(),
+                    queue_id,
+                    Arc::clone(&running_clone),
+                );
+            }
         });
 
         handles.push(handle);

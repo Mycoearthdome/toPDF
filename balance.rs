@@ -1,13 +1,12 @@
-extern crate crc;
+extern crate mnl_sys;
 extern crate ctrlc;
-
 extern crate nftnl_sys;
 extern crate nix;
 
-use libc::{self, getsockname, sockaddr_nl, socket, NFPROTO_IPV4};
+use libc::{self, getsockname, iovec, sockaddr_nl, socket, NFPROTO_IPV4};
 use nftnl_sys::*;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-
+use mnl_sys::*;
 use std::ffi::CString;
 use std::io::{self, Error, ErrorKind, Write};
 use std::marker::PhantomData;
@@ -50,11 +49,71 @@ impl<T> SafePtr<T> {
     }
 }
 
+#[repr(C)]
+    struct Nla {
+        nla_len: u16,
+        nla_type: u16,
+    }
+
 #[repr(C, packed)]
 struct NfQueueMsg {
     id: u32,
     verdict: u32,
 }
+
+pub struct NftnlBatch {
+    batch_ptr: *mut nftnl_batch,
+}
+
+impl NftnlBatch {
+    pub fn new(pg_size: u32, pg_overrun_size: u32) -> Self {
+        let batch_ptr = unsafe { nftnl_batch_alloc(pg_size, pg_overrun_size) };
+        if batch_ptr.is_null() {
+            panic!("Failed to allocate nftnl_batch");
+        }
+        NftnlBatch { batch_ptr }
+    }
+
+    pub fn update(&mut self) -> Result<(), libc::c_int> {
+        let result = unsafe { nftnl_batch_update(self.batch_ptr) };
+        if result < 0 {
+            return Err(result);
+        }
+        Ok(())
+    }
+
+    pub fn free(self) {
+        unsafe {
+            nftnl_batch_free(self.batch_ptr);
+        }
+    }
+
+    pub fn buffer(&self) -> *mut c_void {
+        unsafe { nftnl_batch_buffer(self.batch_ptr) }
+    }
+
+    pub fn buffer_len(&self) -> u32 {
+        unsafe { nftnl_batch_buffer_len(self.batch_ptr) }
+    }
+
+    pub fn iovec_len(&self) -> libc::c_int {
+        unsafe { nftnl_batch_iovec_len(self.batch_ptr) }
+    }
+
+    pub fn iovec(&self, iov: *mut libc::iovec, iovlen: u32) {
+        unsafe { nftnl_batch_iovec(self.batch_ptr, iov, iovlen) }
+    }
+
+    pub fn begin(&mut self, buf: *mut libc::c_char, seq: u32) -> *mut libc::nlmsghdr {
+        unsafe { nftnl_batch_begin(buf, seq) }
+    }
+
+    pub fn end(&mut self, buf: *mut libc::c_char, seq: u32) -> *mut libc::nlmsghdr {
+        unsafe { nftnl_batch_end(buf, seq) }
+    }
+}
+
+
 
 pub enum Verdict {
     NfAccept = 1, //NFQUEUE = 1
@@ -481,29 +540,130 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
     true
 }
 
-fn convert_nlmsghdr_to_msghdr(handler: &NfnlHandle, nl_msg: &libc::nlmsghdr) -> libc::msghdr {
-    // Create an iovec structure pointing to the nlmsghdr
-    let iov = libc::iovec {
-        iov_base: nl_msg as *const _ as *mut c_void,
-        iov_len: nl_msg.nlmsg_len as usize,
+fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, table_name: &str) -> libc::msghdr {
+    let mut batch = NftnlBatch::new(4096, 1024);
+
+    // Prepare sockaddr_nl
+    let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16; // Set to AF_NETLINK
+    addr.nl_pid = unsafe{ (*originalnlh).nlmsg_pid}; // to follow with the handler.
+    addr.nl_groups = 0; // No multicast groups
+
+    // Begin the batch
+    let nlh = batch.begin(buffer.as_mut_ptr() as *mut i8, 0);
+
+    // Construct the batch begin message
+    let nlh_begin = unsafe { &mut *(nlh as *mut libc::nlmsghdr) };
+    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
+    nlh_begin.nlmsg_type = libc::NFNL_MSG_BATCH_BEGIN as u16;
+    nlh_begin.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_begin.nlmsg_seq = 0; // Sequence number
+    nlh_begin.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Construct the new table message
+    let nlh_new_table = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize) as *mut libc::nlmsghdr) };
+    let table_name_length = table_name.len();
+    let total_length = mem::size_of::<libc::nlmsghdr>() + 8 + (mem::size_of::<Nla>() + table_name_length + 1) + 8; // Adjusted for the expected structure
+
+    nlh_new_table.nlmsg_len = total_length as u32; // Total length
+    nlh_new_table.nlmsg_type = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWTABLE) as u16;
+    nlh_new_table.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_new_table.nlmsg_seq = 1; // Sequence number
+    nlh_new_table.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Construct the nfgen family and version
+    let nfgen_family_offset = mem::size_of::<libc::nlmsghdr>();
+    let nfgen_family_msg = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut u8 };
+    unsafe {
+        // Set nfgen_family and version
+        *(nfgen_family_msg as *mut u16) = libc::AF_INET as u16; // Set to AF_INET
+        *(nfgen_family_msg.add(2) as *mut u8) = 0x61; // Set version to NFNETLINK_V0
+        *(nfgen_family_msg.add(3) as *mut u8) = 0; // Reserved
+        *(nfgen_family_msg.add(4) as *mut u16) = 0; // res_id
+    }
+
+    // Construct the Nla for table_name
+    let nla_offset = nfgen_family_offset + 8; // Offset for nfgen family
+    let nla = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nla_offset) as *mut Nla };
+
+    // Set the Nla for table_name
+    unsafe {
+        (*nla).nla_len = (mem::size_of::<Nla>() + table_name_length + 1) as u16; // Length of the attribute
+        (*nla).nla_type = 0x2; // Type of the attribute
+    
+    println!("####NLA Length: {}", (*nla).nla_len); // Debug print
+    }
+
+    // Copy the table name into the Nla
+    let table_name_msg = unsafe { (nla as *mut u8).add(mem::size_of::<Nla>()) as *mut u8 };
+    for i in 0..table_name_length {
+        unsafe { *table_name_msg.offset(i as isize) = table_name.as_bytes()[i] };
+    }
+    unsafe { *table_name_msg.offset(table_name_length as isize) = 0 }; // Null-terminate the string
+    
+    // Set the second nested attribute (8 bytes of zero)
+    let second_nla_offset = nla_offset + mem::size_of::<Nla>() + table_name_length + 1;
+    let second_nla = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(second_nla_offset) as *mut u8 };
+    unsafe {
+        for i in 0..8 {
+            *second_nla.offset(i) = 0; // Fill with zeros
+        }
+    }
+
+    // Construct the batch end message
+    let nlh_end = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize + nlh_new_table.nlmsg_len as usize) as *mut libc::nlmsghdr) };
+    nlh_end.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
+    nlh_end.nlmsg_type = libc::NFNL_MSG_BATCH_END as u16;
+    nlh_end.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_end.nlmsg_seq = 2; // Sequence number
+    nlh_end.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Update the batch buffer
+    unsafe { nftnl_batch_update(batch.batch_ptr) };
+
+    // Prepare the msghdr structure
+    let mut msgh: libc::msghdr = unsafe { mem::zeroed() };
+    msgh.msg_name = &addr as *const _ as *mut c_void; // Correctly set msg_name
+    msgh.msg_namelen = mem::size_of::<sockaddr_nl>() as u32;
+
+    // Prepare the iovec array
+    let mut iov: [libc::iovec; 3] = unsafe { mem::zeroed() }; // Array for 3 messages
+
+    // Populate the iovec array
+    iov[0] = libc::iovec {
+        iov_base: nlh as *mut c_void, // Pointer to the batch begin message
+        iov_len: nlh_begin.nlmsg_len as usize,
+    };
+    iov[1] = libc::iovec {
+        iov_base: nlh_new_table as *mut libc::nlmsghdr as *mut c_void, // Pointer to the new table message
+        iov_len: nlh_new_table.nlmsg_len as usize,
+    };
+    iov[2] = libc::iovec {
+        iov_base: nlh_end as *mut libc::nlmsghdr as *mut c_void, // Pointer to the batch end message
+        iov_len: nlh_end.nlmsg_len as usize,
     };
 
-    // Create a sockaddr_nl structure for the destination address
-    let addr = handler.local;
+    msgh.msg_iov = iov.as_mut_ptr(); // Pointer to the iovec array
+    msgh.msg_iovlen = iov.len() as usize; // Number of iovec entries
+    msgh.msg_control = std::ptr::null_mut(); // No control messages
+    msgh.msg_controllen = 0; // No ancillary data
+    msgh.msg_flags = 0;
 
-    // Create the msghdr structure
-    libc::msghdr {
-        msg_name: &addr as *const _ as *mut c_void,
-        msg_namelen: std::mem::size_of::<libc::sockaddr_nl>() as u32,
-        msg_iov: &iov as *const _ as *mut libc::iovec,
-        msg_iovlen: 1,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    }
+    let msgh_clone = msgh.clone();
+
+    // Free the batch when done
+    batch.free();
+
+    msgh_clone // Return the populated msghdr
 }
+
+
+
+
+
+
 fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
-    let mut buffer = vec![0u8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
+    let mut buffer = [0i8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
     unsafe {
         
         match NfnlHandle::new() {
@@ -523,7 +683,7 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
                 //nftnl_table_set_u64(table, NFTNL_TABLE_HANDLE as u16, handler.subscriptions as u64);
 
                 handler.last_nlhdr = nftnl_nlmsg_build_hdr(
-                    buffer.as_mut_ptr() as *mut i8,
+                    buffer.as_mut_ptr(),
                     libc::NFT_MSG_NEWTABLE as u16,
                     libc::AF_NETLINK as u16,
                     libc::NLM_F_REQUEST as u16, //| libc::NLM_F_CREATE) as u16, //| libc::NLM_F_ACK) as u16,
@@ -533,13 +693,16 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
                 // Add tableNFNL_BUFFSIZE
                 let nlh = handler.last_nlhdr;
                 (*nlh).nlmsg_pid = handler.local.nl_pid;
+
                 nftnl_table_nlmsg_build_payload(nlh, table);
 
                 // Bind the socket
                 //let _ = bind_nfqueue_socket(sock_fd, 0);
 
+                //println!("{:#?}", &buffer[0..100]);
 
-                let msg = convert_nlmsghdr_to_msghdr(&handler, &*nlh);
+                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh, table_name.to_str().unwrap());
+
 
                 if let Err(err) = send_msg_kernel(handler.fd, &msg) {
                     eprintln!("Failed to send TABLE: {}", err);

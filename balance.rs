@@ -546,7 +546,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     // Prepare sockaddr_nl
     let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16; // Set to AF_NETLINK
-    addr.nl_pid = unsafe{ (*originalnlh).nlmsg_pid}; // to follow with the handler.
+    addr.nl_pid = unsafe { (*originalnlh).nlmsg_pid }; // to follow with the handler.
     addr.nl_groups = 0; // No multicast groups
 
     // Begin the batch
@@ -554,7 +554,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
 
     // Construct the batch begin message
     let nlh_begin = unsafe { &mut *(nlh as *mut libc::nlmsghdr) };
-    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
+    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>() + 4) as u32; // Length of the header
     nlh_begin.nlmsg_type = libc::NFNL_MSG_BATCH_BEGIN as u16;
     nlh_begin.nlmsg_flags = libc::NLM_F_REQUEST as u16;
     nlh_begin.nlmsg_seq = 0; // Sequence number
@@ -590,8 +590,6 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     unsafe {
         (*nla).nla_len = (mem::size_of::<Nla>() + table_name_length + 1) as u16; // Length of the attribute
         (*nla).nla_type = 0x2; // Type of the attribute
-    
-    println!("####NLA Length: {}", (*nla).nla_len); // Debug print
     }
 
     // Copy the table name into the Nla
@@ -600,7 +598,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
         unsafe { *table_name_msg.offset(i as isize) = table_name.as_bytes()[i] };
     }
     unsafe { *table_name_msg.offset(table_name_length as isize) = 0 }; // Null-terminate the string
-    
+
     // Set the second nested attribute (8 bytes of zero)
     let second_nla_offset = nla_offset + mem::size_of::<Nla>() + table_name_length + 1;
     let second_nla = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(second_nla_offset) as *mut u8 };
@@ -656,6 +654,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
 
     msgh_clone // Return the populated msghdr
 }
+
 
 
 

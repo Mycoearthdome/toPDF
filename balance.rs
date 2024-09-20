@@ -50,10 +50,20 @@ impl<T> SafePtr<T> {
 }
 
 #[repr(C)]
-    struct Nla {
-        nla_len: u16,
-        nla_type: u16,
-    }
+    //struct Nla {
+    //    nla_type: u16,
+    //    min_len:u16,
+    //    max_len:u16,
+    //}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct NfGenMsg {
+    pub nfgen_family: u8,   // Address family
+    pub nfgen_version: u8,  // Version
+    pub reserved: u8,       // Reserved
+    pub res_id: u16,        // Resource ID
+}
 
 #[repr(C, packed)]
 struct NfQueueMsg {
@@ -552,44 +562,70 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     // Begin the batch
     let nlh = batch.begin(buffer.as_mut_ptr() as *mut i8, 0);
 
+    assert!(nlh as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh is not aligned");
+
     // Construct the batch begin message
     let nlh_begin = unsafe { &mut *(nlh as *mut libc::nlmsghdr) };
-    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>() + 4) as u32; // Length of the header
+    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
     nlh_begin.nlmsg_type = libc::NFNL_MSG_BATCH_BEGIN as u16;
     nlh_begin.nlmsg_flags = libc::NLM_F_REQUEST as u16;
     nlh_begin.nlmsg_seq = 0; // Sequence number
     nlh_begin.nlmsg_pid = addr.nl_pid; // Kernel
 
+    // Assert alignment of nlh_begin
+    assert!(nlh_begin as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_begin is not aligned");
+
     // Construct the new table message
     let nlh_new_table = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize) as *mut libc::nlmsghdr) };
-    let table_name_length = table_name.len();
-    let total_length = mem::size_of::<libc::nlmsghdr>() + 8 + (mem::size_of::<Nla>() + table_name_length + 1) + 8; // Adjusted for the expected structure
+    //let table_name_length = table_name.len();
+    let total_length = mem::size_of::<libc::nlmsghdr>(); // Adjusted for the expected structure
 
     nlh_new_table.nlmsg_len = total_length as u32; // Total length
     nlh_new_table.nlmsg_type = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWTABLE) as u16;
-    nlh_new_table.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_new_table.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
     nlh_new_table.nlmsg_seq = 1; // Sequence number
     nlh_new_table.nlmsg_pid = addr.nl_pid; // Kernel
 
-    // Construct the nfgen family and version
-    let nfgen_family_offset = mem::size_of::<libc::nlmsghdr>();
-    let nfgen_family_msg = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut u8 };
-    unsafe {
-        // Set nfgen_family and version
-        *(nfgen_family_msg as *mut u16) = libc::AF_INET as u16; // Set to AF_INET
-        *(nfgen_family_msg.add(2) as *mut u8) = 0x61; // Set version to NFNETLINK_V0
-        *(nfgen_family_msg.add(3) as *mut u8) = 0; // Reserved
-        *(nfgen_family_msg.add(4) as *mut u16) = 0; // res_id
-    }
+    // Assert alignment of nlh_new_table
+    assert!(nlh_new_table as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_new_table is not aligned");
 
+    let nested;
+    unsafe {
+        nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16);
+        mnl_attr_put_str(nlh_new_table, MNL_TYPE_STRING as u16, table_name.as_ptr() as *const i8);
+        mnl_attr_nest_end(nlh_new_table, nested);
+    }
+/*
+    // Construct the nfgen family and version
+    let nfgen_family_offset = mem::size_of_val(nlh_new_table) as usize + nested_attr_size as usize; // Offset for nfgen family
+    let nfgen_family_msg = unsafe { 
+        (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut NfGenMsg 
+    };
+    // Assert alignment of nfgen_family_msg
+    assert!(nfgen_family_msg as usize % std::mem::align_of::<NfGenMsg>() == 0, "nfgen_family_msg is not aligned");
+
+    unsafe {
+        // Set nfgen_family and version using the struct
+        (*nfgen_family_msg).nfgen_family = libc::AF_INET as u8; // Set to AF_INET
+        (*nfgen_family_msg).nfgen_version = libc::NFNETLINK_V0 as u8; // Set version to NFNETLINK_V0
+        (*nfgen_family_msg).reserved = 0; // Reserved
+        (*nfgen_family_msg).res_id = 0; // res_id
+    }
+ */
+    
+    /*
     // Construct the Nla for table_name
-    let nla_offset = nfgen_family_offset + 8; // Offset for nfgen family
+    let nla_offset = nfgen_family_offset + mem::size_of::<libc::nlmsghdr>() + mem::size_of::<NfGenMsg>(); // Offset for nfgen family
     let nla = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nla_offset) as *mut Nla };
+
+    // Assert alignment of nla
+    assert!(nla as usize % std::mem::align_of::<Nla>() == 0, "nla is not aligned");
 
     // Set the Nla for table_name
     unsafe {
-        (*nla).nla_len = (mem::size_of::<Nla>() + table_name_length + 1) as u16; // Length of the attribute
-        (*nla).nla_type = 0x2; // Type of the attribute
+        (*nla).nla_type = mnl_sys::MNL_TYPE_STRING as u16; // Type of the attribute
+        (*nla).min_len = (table_name_length + 1) as u16; // min_length
+        (*nla).max_len = (table_name_length + 1) as u16; // max_length
     }
 
     // Copy the table name into the Nla
@@ -602,12 +638,16 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     // Set the second nested attribute (8 bytes of zero)
     let second_nla_offset = nla_offset + mem::size_of::<Nla>() + table_name_length + 1;
     let second_nla = unsafe { (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(second_nla_offset) as *mut u8 };
+
+    // Assert alignment of second_nla
+    assert!(second_nla as usize % std::mem::align_of::<Nla>() == 0, "second_nla is not aligned");
+
     unsafe {
         for i in 0..8 {
             *second_nla.offset(i) = 0; // Fill with zeros
         }
     }
-
+ */
     // Construct the batch end message
     let nlh_end = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize + nlh_new_table.nlmsg_len as usize) as *mut libc::nlmsghdr) };
     nlh_end.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
@@ -616,6 +656,9 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     nlh_end.nlmsg_seq = 2; // Sequence number
     nlh_end.nlmsg_pid = addr.nl_pid; // Kernel
 
+    // Assert alignment of nlh_end
+    assert!((nlh_end as *mut libc::nlmsghdr as usize) % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_end is not aligned");
+
     // Update the batch buffer
     unsafe { nftnl_batch_update(batch.batch_ptr) };
 
@@ -623,6 +666,9 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     let mut msgh: libc::msghdr = unsafe { mem::zeroed() };
     msgh.msg_name = &addr as *const _ as *mut c_void; // Correctly set msg_name
     msgh.msg_namelen = mem::size_of::<sockaddr_nl>() as u32;
+
+    // Assert alignment of msgh
+    assert!(msgh.msg_name as usize % std::mem::align_of::<sockaddr_nl>() == 0, "msgh.msg_name is not aligned");
 
     // Prepare the iovec array
     let mut iov: [libc::iovec; 3] = unsafe { mem::zeroed() }; // Array for 3 messages
@@ -654,11 +700,6 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
 
     msgh_clone // Return the populated msghdr
 }
-
-
-
-
-
 
 
 fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
@@ -700,8 +741,8 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
 
                 //println!("{:#?}", &buffer[0..100]);
 
-                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh, table_name.to_str().unwrap());
-
+                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,table_name.to_str().unwrap());
+                
 
                 if let Err(err) = send_msg_kernel(handler.fd, &msg) {
                     eprintln!("Failed to send TABLE: {}", err);

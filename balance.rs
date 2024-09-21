@@ -355,7 +355,7 @@ impl NfnlHandle {
             }
 
             // Enable sequence tracking
-            nfnlh.flags |= NFNL_F_SEQTRACK_ENABLED;
+            //nfnlh.flags |= NFNL_F_SEQTRACK_ENABLED;
 
             Some(nfnlh)
         }
@@ -550,7 +550,7 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
     true
 }
 
-fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, table_name: &str) -> libc::msghdr {
+fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, types: u16, string: &str) -> libc::msghdr {
     let mut batch = NftnlBatch::new(4096, 1024);
 
     // Prepare sockaddr_nl
@@ -581,7 +581,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     let total_length = mem::size_of::<libc::nlmsghdr>(); // Adjusted for the expected structure
 
     nlh_new_table.nlmsg_len = total_length as u32; // Total length
-    nlh_new_table.nlmsg_type = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWTABLE) as u16;
+    nlh_new_table.nlmsg_type = types; // Message types
     nlh_new_table.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
     nlh_new_table.nlmsg_seq = 1; // Sequence number
     nlh_new_table.nlmsg_pid = addr.nl_pid; // Kernel
@@ -592,7 +592,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     let nested;
     unsafe {
         nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16);
-        mnl_attr_put_str(nlh_new_table, MNL_TYPE_STRING as u16, table_name.as_ptr() as *const i8);
+        mnl_attr_put_str(nlh_new_table, MNL_TYPE_STRING as u16, string.as_ptr() as *const i8);
         mnl_attr_nest_end(nlh_new_table, nested);
     }
 /*
@@ -740,8 +740,9 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
                 //let _ = bind_nfqueue_socket(sock_fd, 0);
 
                 //println!("{:#?}", &buffer[0..100]);
+                let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWTABLE) as u16;
 
-                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,table_name.to_str().unwrap());
+                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, table_name.to_str().unwrap());
                 
 
                 if let Err(err) = send_msg_kernel(handler.fd, &msg) {
@@ -793,8 +794,9 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
     }
 }
 
-fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: *const i8) -> (Option<*mut nftnl_chain>, NfnlHandle) {
-    let mut buffer = vec![0u8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
+fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: CString) -> (Option<*mut nftnl_chain>, NfnlHandle) {
+    let mut buffer = [0i8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
+    handler.seq = handler.seq + 1;
     unsafe {
         let chain = nftnl_chain_alloc();
         if chain.is_null() {
@@ -810,16 +812,16 @@ fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: *c
         nftnl_chain_set(
             chain,
             nftnl_sys::NFTNL_CHAIN_NAME as u16,
-            chain_name as *const c_void,
+            chain_name.as_ptr() as *const c_void,
         );
 
         handler.last_nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            libc::NLMSG_DONE as u16,
+            libc::NFT_MSG_NEWCHAIN as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWCHAIN | libc::NLM_F_ACK)
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK)//| libc::NLM_F_CREATE | libc::NFT_MSG_NEWCHAIN | libc::NLM_F_ACK)
                 as u16,
-            0,
+            handler.seq,
         );
 
         // add chain
@@ -828,9 +830,19 @@ fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: *c
         // Bind the socket
         //let _ = bind_nfqueue_socket(handler.fd, 0);
 
-        if let Err(err) = send_to_kernel(handler.fd, &buffer) {
+        let nlh = handler.last_nlhdr;
+            (*nlh).nlmsg_pid = handler.local.nl_pid;
+
+
+        let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWCHAIN) as u16;
+
+
+        let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, chain_name.to_str().unwrap());
+                
+
+        if let Err(err) = send_msg_kernel(handler.fd, &msg) {
             eprintln!("Failed to send CHAIN: {}", err);
-            nftnl_chain_free(chain);
+            nftnl_table_free(table);
             exit_program();
         }
 
@@ -871,6 +883,7 @@ fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: *c
 }
 
 fn create_rule(
+    handler: &mut NfnlHandle,
     raw_fd: RawFd, //handler.fd
     table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
     chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
@@ -878,7 +891,8 @@ fn create_rule(
 ) -> Option<*mut nftnl_rule> {
     let table = table.lock().unwrap().get();
     let chain = chain.lock().unwrap().get();
-    let mut buffer = vec![0u8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
+    let mut buffer = [0i8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
+    handler.seq = handler.seq + queue_num + 1; //queues start at zero.
     unsafe {
         let rule = nftnl_rule_alloc();
         if rule.is_null() {
@@ -901,20 +915,29 @@ fn create_rule(
         nftnl_rule_add_expr(rule, queue_expr);
 
         // add rule
-        let nlhdr = nftnl_nlmsg_build_hdr(
+        handler.last_nlhdr = nftnl_nlmsg_build_hdr(
             buffer.as_mut_ptr() as *mut i8,
-            libc::NLMSG_DONE as u16,
+            libc::NFT_MSG_NEWRULE as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE | libc::NLM_F_ACK)
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) //| libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE |
                 as u16,
-            queue_num,
+            handler.seq,
         );
 
-        nftnl_rule_nlmsg_build_payload(nlhdr, rule);
+        nftnl_rule_nlmsg_build_payload(handler.last_nlhdr, rule);
 
-        if let Err(err) = send_to_kernel(raw_fd, &buffer) {
-            eprintln!("Failed to send RULE for queue {}: {}", queue_num, err);
-            nftnl_rule_free(rule);
+        let nlh = handler.last_nlhdr;
+        (*nlh).nlmsg_pid = handler.local.nl_pid;
+
+        let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWRULE) as u16;
+
+        let rule_name = CString::new(format!("queue_rule_{}", queue_num)).unwrap();
+
+        let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, rule_name.to_str().unwrap());
+                
+        if let Err(err) = send_msg_kernel(handler.fd, &msg) {
+            eprintln!("Failed to send RULE: {}", err);
+            nftnl_table_free(table);
             exit_program();
         }
 
@@ -942,7 +965,7 @@ fn create_rule(
         // Here you would process the response to ensure success.
         // Example of response validation (Netlink message processing)
         if validate_rule_netlink_response(&recv_buffer, recv_len as usize) {
-            println!("Rule successfully created");
+            println!("Rule {} successfully created", rule_name.to_str().unwrap());
         } else {
             nftnl_rule_free(rule);
             libc::close(raw_fd);
@@ -1038,7 +1061,7 @@ fn cleanup(rules: Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>) {
 }
 
 fn allocate_ruleset(
-    handler: &NfnlHandle,
+    handler: &mut NfnlHandle,
     table: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_table>>>,
     chain: &Arc<Mutex<SafePtr<nftnl_sys::nftnl_chain>>>,
     rules: &mut Vec<Arc<Mutex<SafePtr<nftnl_sys::nftnl_rule>>>>,
@@ -1057,7 +1080,7 @@ fn allocate_ruleset(
             continue; // Skip to the next queue if binding fails
         }
 
-        let rule = match create_rule(handler.fd, &table, &chain, queue_num) {
+        let rule = match create_rule(handler, handler.fd, &table, &chain, queue_num) {
             Some(r) => r,
             None => {
                 eprintln!("Failed to create rule for queue {}", queue_num);
@@ -1189,7 +1212,7 @@ fn main() {
     };
 
     // Create chain
-    let (chain, handler) = match create_chain(handler, table.get(), chain_name.as_ptr()) {
+    let (chain, mut handler) = match create_chain(handler, table.get(), chain_name) {
         (Some(c), handler) => (SafePtr::new(c), handler),
         (None, _handler) => {
             eprintln!("Failed to create chain");
@@ -1202,7 +1225,7 @@ fn main() {
 
     let rules = Arc::new(Mutex::new(Vec::new()));
 
-    let raw_fds = allocate_ruleset(&handler, &table_arc, &chain_arc, &mut *rules.lock().unwrap());
+    let raw_fds = allocate_ruleset(&mut handler, &table_arc, &chain_arc, &mut *rules.lock().unwrap());
 
     let running = Arc::new(AtomicBool::new(true));
 
@@ -1213,7 +1236,7 @@ fn main() {
         let running_clone = Arc::clone(&running);
 
         // Spawn a thread for handling packets on this queue
-        let handle = thread::spawn({;
+        let handle = thread::spawn({
             move || {
                 handle_queue(
                     stdout_clone,

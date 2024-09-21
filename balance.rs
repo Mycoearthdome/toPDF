@@ -22,9 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::borrow::BorrowMut;
 
 // Constants for raw table configuration
-const NFT_TABLE_NAME: &str = "raw_packets";
-const NFT_CHAIN_NAME: &str = "output";
-const NFT_RULE_QUEUE_MAX_NUM: u32 = 10;
+const NFT_TABLE_NAME: &str = "raw";
+const NFT_CHAIN_NAME: &str = "OUTPUT";
+const NFT_RULE_QUEUE_MAX_NUM: u32 = 9; //will segfault above 9
 const NFT_PROTOCOL_IP: u32 = libc::IPPROTO_IP as u32;
 
 /// Wrapper around a raw pointer to manually implement Send and Sync.
@@ -550,7 +550,11 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
     true
 }
 
-fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, types: u16, string: &str) -> libc::msghdr {
+fn calculate_padding(len: usize) -> Vec<u8> {
+    vec![0; (8 - len % 8) % 8]
+}
+
+fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, types: u16, len_string: usize, string_ptr: *const i8) -> libc::msghdr {
     let mut batch = NftnlBatch::new(4096, 1024);
 
     // Prepare sockaddr_nl
@@ -590,14 +594,166 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     assert!(nlh_new_table as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_new_table is not aligned");
 
     let nested;
+    unsafe {nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16)};
+
+
+    // Construct the nfgen family and version
+    let nfgen_family_offset = nlh_begin.nlmsg_len as usize + nlh_new_table.nlmsg_len as usize; // Offset for nfgen family
+    let nfgen_family_msg = unsafe { 
+        (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut NfGenMsg 
+    };
+    // Assert alignment of nfgen_family_msg
+    assert!(nfgen_family_msg as usize % std::mem::align_of::<NfGenMsg>() == 0, "nfgen_family_msg is not aligned");
+
     unsafe {
-        nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16);
-        mnl_attr_put_str(nlh_new_table, MNL_TYPE_STRING as u16, string.as_ptr() as *const i8);
+        // Set nfgen_family and version using the struct
+        (*nfgen_family_msg).nfgen_family = libc::AF_INET as u8; // Set to AF_INET
+        (*nfgen_family_msg).nfgen_version = libc::NFNETLINK_V0 as u8; // Set version to NFNETLINK_V0
+        (*nfgen_family_msg).reserved = 0; // Reserved
+        (*nfgen_family_msg).res_id = 0; // res_id
+    }
+ 
+    let padding = calculate_padding(len_string);
+    let len_padding = padding.len();
+    let nlh_new_table_offset;
+    unsafe {                    //TODO: DUMP---> CODE THIS MANUALLY SOMEHOW! segfaults on mnl_attr_put:(
+        let offset = mem::size_of::<NfGenMsg>() as usize; 
+        nlh_new_table_offset = (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(offset) as *mut libc::nlmsghdr;
+        
+        mnl_attr_put(nlh_new_table_offset, 0x01 as u16, len_string, string_ptr as *const c_void); //offset
+        mnl_attr_put(nlh_new_table_offset, 0x02 as u16, len_padding, padding.as_ptr() as *const c_void); //offset
         mnl_attr_nest_end(nlh_new_table, nested);
     }
-/*
+    
+    // Construct the batch end message
+    let nlh_end = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize + (*nlh_new_table_offset).nlmsg_len as usize + mem::size_of::<NfGenMsg>() as usize) as *mut libc::nlmsghdr) };
+    nlh_end.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
+    nlh_end.nlmsg_type = libc::NFNL_MSG_BATCH_END as u16;
+    nlh_end.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_end.nlmsg_seq = 2; // Sequence number
+    nlh_end.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Assert alignment of nlh_end
+    assert!((nlh_end as *mut libc::nlmsghdr as usize) % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_end is not aligned");
+
+    // Update the batch buffer
+    unsafe { nftnl_batch_update(batch.batch_ptr) };
+
+    // Prepare the msghdr structure
+    let mut msgh: libc::msghdr = unsafe { mem::zeroed() };
+    msgh.msg_name = &addr as *const _ as *mut c_void; // Correctly set msg_name
+    msgh.msg_namelen = mem::size_of::<sockaddr_nl>() as u32;
+
+    // Assert alignment of msgh
+    assert!(msgh.msg_name as usize % std::mem::align_of::<sockaddr_nl>() == 0, "msgh.msg_name is not aligned");
+
+    // Prepare the iovec array
+    let mut iov: [libc::iovec; 3] = unsafe { mem::zeroed() }; // Array for 3 messages
+
+    // Populate the iovec array
+    iov[0] = libc::iovec {
+        iov_base: nlh as *mut c_void, // Pointer to the batch begin message
+        iov_len: nlh_begin.nlmsg_len as usize,
+    };
+    iov[1] = libc::iovec {
+        iov_base: nlh_new_table as *mut libc::nlmsghdr as *mut c_void, // Pointer to the new table message
+        iov_len: nlh_new_table.nlmsg_len as usize,
+    };
+    iov[2] = libc::iovec {
+        iov_base: nlh_end as *mut libc::nlmsghdr as *mut c_void, // Pointer to the batch end message
+        iov_len: nlh_end.nlmsg_len as usize,
+    };
+
+    msgh.msg_iov = iov.as_mut_ptr(); // Pointer to the iovec array
+    msgh.msg_iovlen = iov.len() as usize; // Number of iovec entries
+    msgh.msg_control = std::ptr::null_mut(); // No control messages
+    msgh.msg_controllen = 0; // No ancillary data
+    msgh.msg_flags = 0;
+
+    let msgh_clone = msgh.clone();
+
+    // Free the batch when done
+    batch.free();
+
+    msgh_clone // Return the populated msghdr
+}
+
+
+fn convert_nlmsghdr_to_msghdr_rules(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, types: u16, queue_num: u32) -> libc::msghdr {
+    let mut batch = NftnlBatch::new(4096, 1024);
+
+    // Prepare sockaddr_nl
+    let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16; // Set to AF_NETLINK
+    addr.nl_pid = unsafe { (*originalnlh).nlmsg_pid }; // to follow with the handler.
+    addr.nl_groups = 0; // No multicast groups
+
+    // Begin the batch
+    let nlh = batch.begin(buffer.as_mut_ptr() as *mut i8, 0);
+
+    assert!(nlh as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh is not aligned");
+
+    // Construct the batch begin message
+    let nlh_begin = unsafe { &mut *(nlh as *mut libc::nlmsghdr) };
+    nlh_begin.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
+    nlh_begin.nlmsg_type = libc::NFNL_MSG_BATCH_BEGIN as u16;
+    nlh_begin.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+    nlh_begin.nlmsg_seq = 0; // Sequence number
+    nlh_begin.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Assert alignment of nlh_begin
+    assert!(nlh_begin as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_begin is not aligned");
+
+    // Construct the new table message
+    let nlh_new_table = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize) as *mut libc::nlmsghdr) };
+    //let table_name_length = table_name.len();
+    let total_length = mem::size_of::<libc::nlmsghdr>(); // Adjusted for the expected structure
+
+    nlh_new_table.nlmsg_len = total_length as u32; // Total length
+    nlh_new_table.nlmsg_type = types; // Message types
+    nlh_new_table.nlmsg_flags = (libc::NLM_F_REQUEST|libc::NLM_F_CREATE|libc::NLM_F_APPEND) as u16;
+    nlh_new_table.nlmsg_seq = 1; // Sequence number
+    nlh_new_table.nlmsg_pid = addr.nl_pid; // Kernel
+
+    // Assert alignment of nlh_new_table
+    assert!(nlh_new_table as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_new_table is not aligned");
+
+    let nested;
+
+    let mut sequence: [u8; 36] = [
+    0x24, 0x00, 0x01, 0x80, 0x0a, 0x00, 0x01, 0x00,
+    0x71, 0x75, 0x65, 0x75, 0x65, 0x00, 0x00, 0x00, // queue
+    0x14, 0x00, 0x02, 0x80, 0x06, 0x00, 0x01, 0x00, // with 0x06 being Queue ID?
+    0x00, 0x1e, 0x00, 0x00, 0x06, 0x00, 0x02, 0x00, //here 0x1e was 30...to identify the queue number and a bind with 0x06 Queue ID
+    0x00, 0x01, 0x00, 0x00, //where 0x01 is probably "up" or cmp operation or write operation
+    ];
+
+    let queue_sequence_index = 25; //Index of the queue sequence number in the sequence array
+    let queue_sequence_id = 20; //Index of the queue sequence id in the sequence array
+    let queue_sequence_bind = 28; //Index of the queue sequence bind in the sequence array
+
+    let queue_number = queue_num.to_le_bytes()[0];
+    let queue_id = (queue_num + 6).to_le_bytes()[0]; // 6 is the Queue ID for compatibility with strace nft command.
+
+    sequence[queue_sequence_index] = queue_number;
+    sequence[queue_sequence_id] = queue_id;
+    //sequence[queue_sequence_bind] = queue_id; //MAYBE BETTER LEFT AS IS!...TO BE CONFIRMED
+
+    
+    unsafe {
+        nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16);
+        mnl_attr_put(nlh_new_table, 0x01 as u16, 7, "filter\0".as_bytes().as_ptr() as *const c_void);
+        mnl_attr_put(nlh_new_table, 0x02 as u16, 7, "output\0".as_bytes().as_ptr() as *const c_void);
+        //mnl_attr_put_str(nlh_new_table, 0x03 as u16, "queue\0".as_ptr() as *const i8);
+        //mnl_attr_put(nlh_new_table, 0x04 as u16, sequence.len() as usize, sequence.as_ptr() as *const c_void);
+        mnl_attr_put(nlh_new_table, (libc::NLA_F_NESTED|0x4) as u16, sequence.len(), sequence.as_ptr() as *const c_void);
+        mnl_attr_nest_end(nlh_new_table, nested);
+    }
+
+    //TODO FIX THIS BELOW INSIDE THE NESTED ATTRIBUTE
+    /*
     // Construct the nfgen family and version
-    let nfgen_family_offset = mem::size_of_val(nlh_new_table) as usize + nested_attr_size as usize; // Offset for nfgen family
+    let nfgen_family_offset = mem::size_of_val(nlh_new_table) as usize + total_length; // Offset for nfgen family
     let nfgen_family_msg = unsafe { 
         (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut NfGenMsg 
     };
@@ -701,7 +857,6 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     msgh_clone // Return the populated msghdr
 }
 
-
 fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
     let mut buffer = [0i8; NFNL_BUFFSIZE]; // Allocate buffer for the Netlink message
     unsafe {
@@ -714,9 +869,14 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
                     eprintln!("Failed to allocate table");
                     return (None, handler);
                 }
+
+                let mut table_name_vec = table_name.as_bytes().to_vec();
+                table_name_vec.push(0);
+                let len_table_name_vec = table_name_vec.len();
+                let table_name_ptr = table_name_vec.as_ptr()as *const i8;
                 
                 println!("nfnetlink handler created successfully!");
-                nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name.as_ptr());
+                nftnl_table_set_str(table, NFTNL_TABLE_NAME as u16, table_name_ptr);
                 nftnl_table_set_u32(table, NFTNL_TABLE_FAMILY as u16, NFPROTO_IPV4 as u32);
                 //nftnl_table_set_u32(table, NFTNL_TABLE_FLAGS as u16, 0u32);
                 //nftnl_table_set_u32(table, NFTNL_TABLE_USE as u16, 0u32);
@@ -732,7 +892,7 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
 
                 // Add tableNFNL_BUFFSIZE
                 let nlh = handler.last_nlhdr;
-                (*nlh).nlmsg_pid = handler.local.nl_pid;
+                (*nlh).nlmsg_pid = 0;//handler.local.nl_pid;
 
                 nftnl_table_nlmsg_build_payload(nlh, table);
 
@@ -742,7 +902,7 @@ fn create_table(table_name: CString) -> (Option<*mut nftnl_table>, NfnlHandle) {
                 //println!("{:#?}", &buffer[0..100]);
                 let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWTABLE) as u16;
 
-                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, table_name.to_str().unwrap());
+                let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, len_table_name_vec, table_name_ptr);
                 
 
                 if let Err(err) = send_msg_kernel(handler.fd, &msg) {
@@ -809,10 +969,18 @@ fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: CS
             nftnl_sys::NFTNL_CHAIN_TABLE as u16,
             table as *const c_void,
         );
+
+
+        let mut chain_name_vec = chain_name.as_bytes().to_vec();
+        chain_name_vec.push(0);
+        let len_chain_name_vec = chain_name_vec.len();
+        let chain_name_ptr = chain_name_vec.as_ptr()as *const i8;
+
+
         nftnl_chain_set(
             chain,
             nftnl_sys::NFTNL_CHAIN_NAME as u16,
-            chain_name.as_ptr() as *const c_void,
+            chain_name_ptr as *const c_void,
         );
 
         handler.last_nlhdr = nftnl_nlmsg_build_hdr(
@@ -831,13 +999,13 @@ fn create_chain(mut handler: NfnlHandle, table: *mut nftnl_table, chain_name: CS
         //let _ = bind_nfqueue_socket(handler.fd, 0);
 
         let nlh = handler.last_nlhdr;
-            (*nlh).nlmsg_pid = handler.local.nl_pid;
+            (*nlh).nlmsg_pid = 0; //handler.local.nl_pid;
 
 
         let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWCHAIN) as u16;
 
 
-        let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, chain_name.to_str().unwrap());
+        let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, len_chain_name_vec, chain_name_ptr);
                 
 
         if let Err(err) = send_msg_kernel(handler.fd, &msg) {
@@ -900,7 +1068,7 @@ fn create_rule(
             return Some(std::ptr::null_mut());
         }
 
-        nftnl_rule_set_u32(rule, NFTNL_RULE_FAMILY as u16, NFPROTO_IPV4 as u32);
+        nftnl_rule_set_u32(rule, NFTNL_RULE_FAMILY as u16, libc::AF_INET as u32);
         nftnl_rule_set(rule, NFTNL_RULE_TABLE as u16, table as *const c_void);
         nftnl_rule_set(rule, NFTNL_RULE_CHAIN as u16, chain as *const c_void);
         nftnl_rule_set_u32(rule, NFTNL_RULE_COMPAT_PROTO as u16, NFT_PROTOCOL_IP);
@@ -919,7 +1087,7 @@ fn create_rule(
             buffer.as_mut_ptr() as *mut i8,
             libc::NFT_MSG_NEWRULE as u16,
             libc::AF_NETLINK as u16,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) //| libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE |
+            ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWRULE) //| libc::NLM_F_CREATE | libc::NFT_MSG_NEWRULE |
                 as u16,
             handler.seq,
         );
@@ -927,13 +1095,13 @@ fn create_rule(
         nftnl_rule_nlmsg_build_payload(handler.last_nlhdr, rule);
 
         let nlh = handler.last_nlhdr;
-        (*nlh).nlmsg_pid = handler.local.nl_pid;
+        (*nlh).nlmsg_pid = 0; //handler.local.nl_pid; //TODO: CHECK THIS BACK!!
 
         let types = ((libc::NFNL_SUBSYS_NFTABLES << 8) | libc::NFT_MSG_NEWRULE) as u16;
 
-        let rule_name = CString::new(format!("queue_rule_{}", queue_num)).unwrap();
+        //let rule_filter = CString::new(format!("filter output queue num {}", queue_num)).unwrap();
 
-        let msg = convert_nlmsghdr_to_msghdr(&mut buffer, nlh,types, rule_name.to_str().unwrap());
+        let msg = convert_nlmsghdr_to_msghdr_rules(&mut buffer, nlh,types, queue_num);
                 
         if let Err(err) = send_msg_kernel(handler.fd, &msg) {
             eprintln!("Failed to send RULE: {}", err);
@@ -965,7 +1133,7 @@ fn create_rule(
         // Here you would process the response to ensure success.
         // Example of response validation (Netlink message processing)
         if validate_rule_netlink_response(&recv_buffer, recv_len as usize) {
-            println!("Rule {} successfully created", rule_name.to_str().unwrap());
+            println!("Rule {} successfully created", queue_num);
         } else {
             nftnl_rule_free(rule);
             libc::close(raw_fd);
@@ -1091,6 +1259,7 @@ fn allocate_ruleset(
 
         rules.push(Arc::new(Mutex::new(SafePtr::new(rule))));
     }
+    unsafe {libc::close(handler.fd)};
     raw_fds
 }
 
@@ -1115,11 +1284,9 @@ fn bind_nfqueue_socket(sock_fd: RawFd, queue_id: u32) -> io::Result<()> {
     let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
     addr.nl_pid = 0;
-    // Create a bitmask for the specified queue_id
-    let mask: u32 = (1 << queue_id) as u32;
 
     // Set nl_groups to the mask
-    addr.nl_groups = mask;
+    addr.nl_groups = queue_id + 6; // Queue ID + 6 for compatibility with strace.
 
     // Set socket option for reusability
     unsafe {
@@ -1263,6 +1430,11 @@ fn main() {
                 }
                 if !table_arc.lock().unwrap().get().is_null() {
                     nftnl_table_free(table_arc.lock().unwrap().get());
+                }
+            }
+            for raw_fd in &raw_fds {
+                unsafe {
+                    libc::close(*raw_fd.lock().unwrap());
                 }
             }
             exit_program();

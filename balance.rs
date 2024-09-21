@@ -62,7 +62,7 @@ pub struct NfGenMsg {
     pub nfgen_family: u8,   // Address family
     pub nfgen_version: u8,  // Version
     pub reserved: u8,       // Reserved
-    pub res_id: u16,        // Resource ID
+    pub res_id: u8,        // Resource ID
 }
 
 #[repr(C, packed)]
@@ -551,7 +551,7 @@ fn validate_rule_netlink_response(recv_buffer: &[u8], recv_len: usize) -> bool {
 }
 
 fn calculate_padding(len: usize) -> Vec<u8> {
-    vec![0; (8 - len % 8) % 8]
+    vec![0; if len % 8 == 0 { 0 } else { 8 - len % 8 }]
 }
 
 fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghdr, types: u16, len_string: usize, string_ptr: *const i8) -> libc::msghdr {
@@ -593,14 +593,45 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     // Assert alignment of nlh_new_table
     assert!(nlh_new_table as *mut libc::nlmsghdr as usize % std::mem::align_of::<libc::nlmsghdr>() == 0, "nlh_new_table is not aligned");
 
-    let nested;
-    unsafe {nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16)};
+    //INJECTION <NfGenMsg>
 
-
-    // Construct the nfgen family and version
     let nfgen_family_offset = nlh_begin.nlmsg_len as usize + nlh_new_table.nlmsg_len as usize; // Offset for nfgen family
+
+    //END INJECTION
+
+
+    // Construct the nested attributes
+    let padding = calculate_padding(len_string);
+    let len_padding = padding.len();
+    println!("Padding length: {}", len_padding);
+    //let nlh_new_table_offset;
+    let nested;
+    let b4_attributes = nlh_new_table.nlmsg_len as usize;
+    unsafe {
+        let offset = mem::size_of::<NfGenMsg>() as usize;
+        //nlh_new_table_offset = (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(offset) as *mut libc::nlmsghdr;
+        nested = mnl_attr_nest_start(nlh_new_table, MNL_TYPE_NESTED as u16);
+        mnl_attr_put(nlh_new_table, 0x01 as u16, len_string, string_ptr as *const c_void); //offset
+        mnl_attr_put(nlh_new_table, 0x02 as u16, len_padding, padding.as_ptr() as *const c_void); //offset
+        mnl_attr_nest_end(nlh_new_table, nested);
+    }
+    let after_attributes = nlh_new_table.nlmsg_len as usize;
+
+    let len_attributes = after_attributes - b4_attributes;
+    
+    let before = unsafe {
+        std::slice::from_raw_parts(nlh_new_table, nfgen_family_offset).to_vec().as_mut_ptr()
+    };
+
+    let after = unsafe {
+        std::slice::from_raw_parts(nlh_new_table, nfgen_family_offset + len_attributes).to_vec()
+    };
+
+
+    // Construct the nfgen family and version and INJECT IT BEFORE the attributes.
+    //let nfgen_family_offset = nlh_begin.nlmsg_len as usize + nlh_new_table.nlmsg_len as usize; // Offset for nfgen family
     let nfgen_family_msg = unsafe { 
-        (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(nfgen_family_offset) as *mut NfGenMsg 
+        (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(b4_attributes) as *mut NfGenMsg 
     };
     // Assert alignment of nfgen_family_msg
     assert!(nfgen_family_msg as usize % std::mem::align_of::<NfGenMsg>() == 0, "nfgen_family_msg is not aligned");
@@ -612,21 +643,28 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
         (*nfgen_family_msg).reserved = 0; // Reserved
         (*nfgen_family_msg).res_id = 0; // res_id
     }
- 
-    let padding = calculate_padding(len_string);
-    let len_padding = padding.len();
-    let nlh_new_table_offset;
-    unsafe {                    //TODO: DUMP---> CODE THIS MANUALLY SOMEHOW! segfaults on mnl_attr_put:(
-        let offset = mem::size_of::<NfGenMsg>() as usize; 
-        nlh_new_table_offset = (nlh_new_table as *mut libc::nlmsghdr as *mut u8).add(offset) as *mut libc::nlmsghdr;
-        
-        mnl_attr_put(nlh_new_table_offset, 0x01 as u16, len_string, string_ptr as *const c_void); //offset
-        mnl_attr_put(nlh_new_table_offset, 0x02 as u16, len_padding, padding.as_ptr() as *const c_void); //offset
-        mnl_attr_nest_end(nlh_new_table, nested);
-    }
+
+    // Inject the attributes back here?....
     
+    //adjust the length of the nlh_new_table
+    nlh_new_table.nlmsg_len = nlh_new_table.nlmsg_len + mem::size_of::<NfGenMsg>() as u32;
+
+    let attributes_offset = nfgen_family_offset + mem::size_of::<NfGenMsg>() as usize;
+
+    unsafe {
+    let new_table_vector = std::slice::from_raw_parts(nlh_new_table, attributes_offset).to_vec();
+
+    let mut full_table = new_table_vector;
+    full_table.extend_from_slice(&after);
+
+
+    *nlh_new_table = *full_table.as_ptr() as libc::nlmsghdr;
+    }
+
+    // End Injection
+
     // Construct the batch end message
-    let nlh_end = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize + (*nlh_new_table_offset).nlmsg_len as usize + mem::size_of::<NfGenMsg>() as usize) as *mut libc::nlmsghdr) };
+    let nlh_end = unsafe { &mut *(nlh.add(nlh_begin.nlmsg_len as usize + (*nlh_new_table).nlmsg_len as usize + attributes_offset) as *mut libc::nlmsghdr) };
     nlh_end.nlmsg_len = (mem::size_of::<libc::nlmsghdr>()) as u32; // Length of the header
     nlh_end.nlmsg_type = libc::NFNL_MSG_BATCH_END as u16;
     nlh_end.nlmsg_flags = libc::NLM_F_REQUEST as u16;
@@ -657,7 +695,7 @@ fn convert_nlmsghdr_to_msghdr(buffer: &mut [i8], originalnlh: *mut libc::nlmsghd
     };
     iov[1] = libc::iovec {
         iov_base: nlh_new_table as *mut libc::nlmsghdr as *mut c_void, // Pointer to the new table message
-        iov_len: nlh_new_table.nlmsg_len as usize,
+        iov_len: (nlh_new_table.nlmsg_len) as usize,
     };
     iov[2] = libc::iovec {
         iov_base: nlh_end as *mut libc::nlmsghdr as *mut c_void, // Pointer to the batch end message
